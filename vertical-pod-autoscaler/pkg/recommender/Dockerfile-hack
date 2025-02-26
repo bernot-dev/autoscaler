@@ -1,0 +1,5 @@
+FROM gcr.io/distroless/static:nonroot
+
+COPY recommender /recommender
+
+ENTRYPOINT ["/recommender"]

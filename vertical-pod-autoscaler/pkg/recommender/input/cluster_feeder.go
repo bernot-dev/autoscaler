@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	kube_client "k8s.io/client-go/kubernetes"
@@ -410,6 +411,27 @@ func (feeder *clusterStateFeeder) LoadVPAs(ctx context.Context) {
 		return
 	}
 
+	for i, vpa := range allVpaCRDs {
+		if vpa.Spec.TargetRef.Kind == "DaemonSet" {
+			klog.Info(">>> DAEMONSET HANDLER TRIGGERED <<<")
+			nodeList, err := feeder.coreClient.Nodes().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				klog.ErrorS(err, "Cannot list nodes")
+				return
+			}
+			for _, node := range nodeList.Items {
+				perNodeVPA := vpa.DeepCopy()
+				if perNodeVPA.Labels == nil {
+					perNodeVPA.Labels = make(map[string]string)
+				}
+				perNodeVPA.Labels["app.kubernetes.io/node"] = node.Name
+				klog.Infof("node: %s, labels: %v", node.Name, perNodeVPA.Labels)
+				allVpaCRDs = append(allVpaCRDs, perNodeVPA)
+			}
+			allVpaCRDs = slices.Delete(allVpaCRDs, i, i+1)
+		}
+	}
+
 	// Filter out VPAs that specified recommenders with names not equal to "default"
 	vpaCRDs := filterVPAs(feeder, allVpaCRDs)
 
@@ -423,6 +445,8 @@ func (feeder *clusterStateFeeder) LoadVPAs(ctx context.Context) {
 		}
 
 		selector, conditions := feeder.getSelector(ctx, vpaCRD)
+		nodeRequirement, _ := labels.NewRequirement("app.kubernetes.io/node", selection.In, []string{vpaCRD.Labels["app.kubernetes.io/node"]})
+		selector = selector.Add(*nodeRequirement)
 		klog.V(4).InfoS("Using selector", "selector", selector.String(), "vpa", klog.KObj(vpaCRD))
 
 		if feeder.clusterState.AddOrUpdateVpa(vpaCRD, selector) == nil {
