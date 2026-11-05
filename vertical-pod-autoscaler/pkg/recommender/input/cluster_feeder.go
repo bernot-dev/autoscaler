@@ -37,6 +37,7 @@ import (
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1"
 	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/metrics"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
@@ -63,6 +64,9 @@ type ClusterStateFeeder interface {
 	// InitFromCheckpoints loads historical checkpoints into clusterState.
 	InitFromCheckpoints(ctx context.Context)
 
+	// LoadNodes updates clusterState with current node labels when VPANodeSelector is enabled.
+	LoadNodes()
+
 	// LoadVPAs updates clusterState with current state of VPAs.
 	LoadVPAs(ctx context.Context)
 
@@ -87,6 +91,7 @@ type ClusterStateFeederFactory struct {
 	VpaCheckpointLister vpa_lister.VerticalPodAutoscalerCheckpointLister
 	VpaLister           vpa_lister.VerticalPodAutoscalerLister
 	PodLister           listersv1.PodLister
+	NodeLister          listersv1.NodeLister
 	OOMObserver         oom.Observer
 	SelectorFetcher     target.VpaTargetSelectorFetcher
 	MemorySaveMode      bool
@@ -105,6 +110,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		vpaCheckpointClient: m.VpaCheckpointClient,
 		vpaCheckpointLister: m.VpaCheckpointLister,
 		vpaLister:           m.VpaLister,
+		nodeLister:          m.NodeLister,
 		clusterState:        m.ClusterState,
 		specClient:          spec.NewSpecClient(m.PodLister),
 		selectorFetcher:     m.SelectorFetcher,
@@ -218,6 +224,7 @@ type clusterStateFeeder struct {
 	vpaCheckpointClient vpa_api.VerticalPodAutoscalerCheckpointsGetter
 	vpaCheckpointLister vpa_lister.VerticalPodAutoscalerCheckpointLister
 	vpaLister           vpa_lister.VerticalPodAutoscalerLister
+	nodeLister          listersv1.NodeLister
 	clusterState        model.ClusterState
 	selectorFetcher     target.VpaTargetSelectorFetcher
 	memorySaveMode      bool
@@ -261,6 +268,7 @@ func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider histor
 
 func (feeder *clusterStateFeeder) InitFromCheckpoints(ctx context.Context) {
 	klog.V(3).InfoS("Initializing VPA from checkpoints")
+	feeder.LoadNodes()
 	feeder.LoadVPAs(ctx)
 
 	checkpointList, err := feeder.vpaCheckpointLister.List(labels.Everything())
@@ -386,6 +394,23 @@ func filterVPAs(feeder *clusterStateFeeder, allVpaCRDs []*vpa_types.VerticalPodA
 	return vpaCRDs
 }
 
+// LoadNodes fetches Node objects and updates node labels in ClusterState when VPANodeSelector is enabled.
+func (feeder *clusterStateFeeder) LoadNodes() {
+	if !features.Enabled(features.VPANodeSelector) || feeder.nodeLister == nil {
+		return
+	}
+	nodeList, err := feeder.nodeLister.List(labels.Everything())
+	if err != nil {
+		klog.ErrorS(err, "Cannot list nodes")
+		return
+	}
+	nodes := make(map[string]labels.Set, len(nodeList))
+	for _, node := range nodeList {
+		nodes[node.Name] = labels.Set(node.Labels)
+	}
+	feeder.clusterState.SetNodes(nodes)
+}
+
 // LoadVPAs fetches VPA objects and loads them into the cluster state.
 func (feeder *clusterStateFeeder) LoadVPAs(ctx context.Context) {
 	// List VPA API objects.
@@ -458,7 +483,11 @@ func (feeder *clusterStateFeeder) LoadPods() {
 		if feeder.memorySaveMode && !feeder.matchesVPA(pod) {
 			continue
 		}
-		feeder.clusterState.AddOrUpdatePod(pod.ID, pod.PodLabels, pod.Phase)
+		if features.Enabled(features.VPANodeSelector) {
+			feeder.clusterState.AddOrUpdatePodWithNode(pod.ID, pod.PodLabels, pod.Phase, pod.NodeName)
+		} else {
+			feeder.clusterState.AddOrUpdatePod(pod.ID, pod.PodLabels, pod.Phase)
+		}
 		for _, container := range pod.Containers {
 			if err = feeder.clusterState.AddOrUpdateContainer(container.ID, container.Request); err != nil {
 				klog.V(0).InfoS("Failed to add container", "container", container.ID, "error", err)
@@ -530,11 +559,21 @@ Loop:
 }
 
 func (feeder *clusterStateFeeder) matchesVPA(pod *spec.BasicPodSpec) bool {
+	podLabels := labels.Set(pod.PodLabels)
 	for vpaKey, vpa := range feeder.clusterState.VPAs() {
-		podLabels := labels.Set(pod.PodLabels)
-		if vpaKey.Namespace == pod.ID.Namespace && vpa.PodSelector.Matches(podLabels) {
-			return true
+		if vpaKey.Namespace != pod.ID.Namespace || vpa.PodSelector == nil || !vpa.PodSelector.Matches(podLabels) {
+			continue
 		}
+		if features.Enabled(features.VPANodeSelector) && vpa.HasSelector {
+			if pod.NodeName == "" || vpa.NodeSelector == nil || feeder.nodeLister == nil {
+				continue
+			}
+			node, err := feeder.nodeLister.Get(pod.NodeName)
+			if err != nil || !vpa.NodeSelector.Matches(labels.Set(node.Labels)) {
+				continue
+			}
+		}
+		return true
 	}
 	return false
 }

@@ -17,17 +17,23 @@ limitations under the License.
 package model
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -45,6 +51,11 @@ const (
 type ClusterState interface {
 	StateMapSize() int
 	AddOrUpdatePod(podID PodID, newLabels labels.Set, phase corev1.PodPhase)
+	AddOrUpdatePodWithNode(podID PodID, newLabels labels.Set, phase corev1.PodPhase, nodeName string)
+	SetNodes(nodes map[string]labels.Set)
+	AddOrUpdateNode(nodeName string, nodeLabels labels.Set)
+	DeleteNode(nodeName string)
+	UpdateSelectorOverlapConditions()
 	SetInitContainers(podID PodID, initContainers []string) error
 	GetContainer(containerID ContainerID) *ContainerState
 	DeletePod(podID PodID)
@@ -70,6 +81,8 @@ type clusterState struct {
 	pods map[PodID]*PodState
 	// VPA objects in the cluster.
 	vpas map[VpaID]*Vpa
+	// Nodes in the cluster mapped to their label sets.
+	nodes map[string]labels.Set
 	// VPA objects in the cluster that have no recommendation mapped to the first
 	// time we've noticed the recommendation missing or last time we logged
 	// a warning about it.
@@ -102,6 +115,7 @@ type AggregateStateKey interface {
 	Namespace() string
 	ContainerName() string
 	Labels() labels.Labels
+	NodeName() string
 }
 
 // String representation of the labels.LabelSet. This is the value returned by
@@ -120,8 +134,12 @@ type PodState struct {
 	ID PodID
 	// Set of labels attached to the Pod.
 	labelSetKey labelSetKey
+	// NodeName is the name of the node the Pod runs on.
+	NodeName string
 	// Containers that belong to the Pod, keyed by the container name.
 	Containers map[string]*ContainerState
+	// containerAggKeys tracks the current AggregateStateKey for each container.
+	containerAggKeys map[string]AggregateStateKey
 	// InitContainers is a list of init containers names which belong to the Pod.
 	InitContainers []string
 	// PodPhase describing current life cycle phase of the Pod.
@@ -133,6 +151,7 @@ func NewClusterState(gcInterval time.Duration) *clusterState {
 	return &clusterState{
 		pods:                          make(map[PodID]*PodState),
 		vpas:                          make(map[VpaID]*Vpa),
+		nodes:                         make(map[string]labels.Set),
 		emptyVPAs:                     make(map[VpaID]time.Time),
 		aggregateStateMap:             make(aggregateContainerStatesMap),
 		labelSetMap:                   make(labelSetMap),
@@ -154,6 +173,15 @@ type ContainerUsageSampleWithKey struct {
 // If the labels of the pod have changed, it updates the links between the containers
 // and the aggregations.
 func (cluster *clusterState) AddOrUpdatePod(podID PodID, newLabels labels.Set, phase corev1.PodPhase) {
+	nodeName := ""
+	if existing, ok := cluster.pods[podID]; ok {
+		nodeName = existing.NodeName
+	}
+	cluster.AddOrUpdatePodWithNode(podID, newLabels, phase, nodeName)
+}
+
+// AddOrUpdatePodWithNode updates the state of the pod including the node it runs on.
+func (cluster *clusterState) AddOrUpdatePodWithNode(podID PodID, newLabels labels.Set, phase corev1.PodPhase, nodeName string) {
 	pod, podExists := cluster.pods[podID]
 	if !podExists {
 		pod = newPod(podID)
@@ -161,16 +189,26 @@ func (cluster *clusterState) AddOrUpdatePod(podID PodID, newLabels labels.Set, p
 	}
 
 	newlabelSetKey := cluster.getLabelSetKey(newLabels)
-	if podExists && pod.labelSetKey != newlabelSetKey {
+	labelsOrNodeChanged := pod.labelSetKey != newlabelSetKey || pod.NodeName != nodeName
+	if podExists && labelsOrNodeChanged {
 		// This Pod is already counted in the old VPA, remove the link.
 		cluster.removePodFromItsVpa(pod)
 	}
-	if !podExists || pod.labelSetKey != newlabelSetKey {
+	if !podExists || labelsOrNodeChanged {
 		pod.labelSetKey = newlabelSetKey
-		// Set the links between the containers and aggregations based on the current pod labels.
+		pod.NodeName = nodeName
+		if len(pod.Containers) > 0 {
+			cluster.reconcilePodAggregations()
+		}
+		// Ensure aggregations exist for current pod keys while keeping ContainerStateAggregatorProxy intact.
 		for containerName, container := range pod.Containers {
 			containerID := ContainerID{PodID: podID, ContainerName: containerName}
-			container.aggregator = cluster.findOrCreateAggregateContainerState(containerID)
+			cluster.findOrCreateAggregateContainerState(containerID)
+			if pod.containerAggKeys == nil {
+				pod.containerAggKeys = make(map[string]AggregateStateKey)
+			}
+			pod.containerAggKeys[containerName] = cluster.MakeAggregateStateKey(pod, containerName)
+			container.aggregator = NewContainerStateAggregatorProxy(cluster, containerID)
 		}
 
 		cluster.addPodToItsVpa(pod)
@@ -190,11 +228,33 @@ func (cluster *clusterState) SetInitContainers(podID PodID, initContainers []str
 	return nil
 }
 
+func (cluster *clusterState) getNodeLabels(nodeName string) (labels.Set, bool) {
+	nLabels, ok := cluster.nodes[nodeName]
+	return nLabels, ok
+}
+
+func (cluster *clusterState) podMatchesVPA(pod *PodState, vpa *Vpa) bool {
+	if !vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, cluster.labelSetMap[pod.labelSetKey], vpa.ID.Namespace, vpa.PodSelector) {
+		return false
+	}
+	if features.Enabled(features.VPANodeSelector) && vpa.HasSelector {
+		if pod.NodeName == "" || vpa.NodeSelector == nil {
+			return false
+		}
+		nLabels, ok := cluster.nodes[pod.NodeName]
+		if !ok {
+			return false
+		}
+		return vpa.NodeSelector.Matches(nLabels)
+	}
+	return true
+}
+
 // addPodToItsVpa increases the count of Pods associated with a VPA object.
 // Does a scan similar to findOrCreateAggregateContainerState so could be optimized if needed.
 func (cluster *clusterState) addPodToItsVpa(pod *PodState) {
 	for _, vpa := range cluster.vpas {
-		if vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, cluster.labelSetMap[pod.labelSetKey], vpa.ID.Namespace, vpa.PodSelector) {
+		if cluster.podMatchesVPA(pod, vpa) {
 			vpa.PodCount++
 		}
 	}
@@ -203,7 +263,7 @@ func (cluster *clusterState) addPodToItsVpa(pod *PodState) {
 // removePodFromItsVpa decreases the count of Pods associated with a VPA object.
 func (cluster *clusterState) removePodFromItsVpa(pod *PodState) {
 	for _, vpa := range cluster.vpas {
-		if vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, cluster.labelSetMap[pod.labelSetKey], vpa.ID.Namespace, vpa.PodSelector) {
+		if cluster.podMatchesVPA(pod, vpa) {
 			vpa.PodCount--
 		}
 	}
@@ -242,6 +302,10 @@ func (cluster *clusterState) AddOrUpdateContainer(containerID ContainerID, reque
 	}
 	if container, containerExists := pod.Containers[containerID.ContainerName]; !containerExists {
 		cluster.findOrCreateAggregateContainerState(containerID)
+		if pod.containerAggKeys == nil {
+			pod.containerAggKeys = make(map[string]AggregateStateKey)
+		}
+		pod.containerAggKeys[containerID.ContainerName] = cluster.MakeAggregateStateKey(pod, containerID.ContainerName)
 		pod.Containers[containerID.ContainerName] = NewContainerState(request, NewContainerStateAggregatorProxy(cluster, containerID))
 	} else {
 		// Container aleady exists. Possibly update the request.
@@ -301,6 +365,19 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 		currentRecommendation = apiObject.Status.Recommendation
 	}
 
+	var hasNodeSelector bool
+	var nodeSelector labels.Selector
+	if features.Enabled(features.VPANodeSelector) && vpa_utils.HasSelector(apiObject) {
+		hasNodeSelector = true
+		parsed, err := metav1.LabelSelectorAsSelector(apiObject.Spec.Selector.NodeSelector)
+		if err != nil {
+			klog.ErrorS(err, "Invalid nodeSelector on VPA", "vpa", klog.KObj(apiObject))
+			nodeSelector = labels.Nothing()
+		} else {
+			nodeSelector = parsed
+		}
+	}
+
 	vpa, vpaExists := cluster.vpas[vpaID]
 	if vpaExists && (vpa.PodSelector.String() != selector.String()) {
 		// Pod selector was changed. Delete the VPA object and recreate
@@ -310,15 +387,28 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 		}
 		vpaExists = false
 	}
+
+	nodeSelectorChanged := false
+	if vpaExists {
+		oldNS := ""
+		if vpa.NodeSelector != nil {
+			oldNS = vpa.NodeSelector.String()
+		}
+		newNS := ""
+		if nodeSelector != nil {
+			newNS = nodeSelector.String()
+		}
+		nodeSelectorChanged = vpa.HasSelector != hasNodeSelector || oldNS != newNS
+	}
+
 	if !vpaExists {
 		vpa = NewVpa(vpaID, selector, apiObject.CreationTimestamp.Time)
 		cluster.vpas[vpaID] = vpa
-		for aggregationKey, aggregation := range cluster.aggregateStateMap {
-			vpa.UseAggregationIfMatching(aggregationKey, aggregation)
-		}
-		vpa.PodCount = len(cluster.GetMatchingPods(vpa))
 	}
 	vpa.TargetRef = apiObject.Spec.TargetRef
+	vpa.HasSelector = hasNodeSelector
+	vpa.NodeSelector = nodeSelector
+	vpa.nodeLabels = cluster.getNodeLabels
 	vpa.Annotations = annotationsMap
 	vpa.SetConditionsMap(conditionsMap)
 	vpa.SetRecommendationDirect(currentRecommendation)
@@ -326,6 +416,26 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
 	vpa.SetAPIVersion(apiObject.GetObjectKind().GroupVersionKind().Version)
 	vpa.Generation = apiObject.Generation
+
+	if !vpaExists || nodeSelectorChanged {
+		if features.Enabled(features.VPANodeSelector) {
+			cluster.reconcilePodAggregations()
+		}
+		for aggregationKey, aggregation := range cluster.aggregateStateMap {
+			if vpa.matchesAggregation(aggregationKey) {
+				vpa.UseAggregationIfMatching(aggregationKey, aggregation)
+			} else if vpa.UsesAggregation(aggregationKey) {
+				vpa.DeleteAggregation(aggregationKey)
+				cluster.refreshAggregationController(aggregationKey, aggregation)
+			}
+		}
+		if features.Enabled(features.VPANodeSelector) {
+			cluster.refreshAllAggregationControllers()
+			cluster.recomputePodCounts()
+		} else {
+			vpa.PodCount = len(cluster.GetMatchingPods(vpa))
+		}
+	}
 	return nil
 }
 
@@ -335,10 +445,21 @@ func (cluster *clusterState) DeleteVpa(vpaID VpaID) error {
 	if !vpaExists {
 		return NewKeyError(vpaID)
 	}
-	for _, state := range vpa.aggregateContainerStates {
-		state.MarkNotAutoscaled()
+	wasSelectorVPA := vpa.HasSelector
+	for key, state := range vpa.aggregateContainerStates {
+		if !features.Enabled(features.VPANodeSelector) || state.releaseControl(vpa) {
+			state.MarkNotAutoscaled()
+		}
+		delete(vpa.aggregateContainerStates, key)
 	}
 	delete(cluster.vpas, vpaID)
+	if features.Enabled(features.VPANodeSelector) {
+		if wasSelectorVPA {
+			cluster.reconcilePodAggregations()
+		}
+		cluster.refreshAllAggregationControllers()
+		cluster.recomputePodCounts()
+	}
 	cluster.mutex.Lock()
 	defer cluster.mutex.Unlock()
 	delete(cluster.emptyVPAs, vpaID)
@@ -363,8 +484,334 @@ func (cluster *clusterState) ObservedVPAs() []*vpa_types.VerticalPodAutoscaler {
 
 func newPod(id PodID) *PodState {
 	return &PodState{
-		ID:         id,
-		Containers: make(map[string]*ContainerState),
+		ID:               id,
+		Containers:       make(map[string]*ContainerState),
+		containerAggKeys: make(map[string]AggregateStateKey),
+	}
+}
+
+func (cluster *clusterState) shouldKeyByNode(pod *PodState) bool {
+	if !features.Enabled(features.VPANodeSelector) || pod == nil || pod.NodeName == "" {
+		return false
+	}
+	podLabels := cluster.labelSetMap[pod.labelSetKey]
+	for _, vpa := range cluster.vpas {
+		if !vpa.HasSelector || vpa.TargetRef == nil || vpa.TargetRef.Kind != "DaemonSet" {
+			continue
+		}
+		if vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, podLabels, vpa.ID.Namespace, vpa.PodSelector) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetNodes updates the full map of cluster nodes and their labels, refreshing
+// node-scoped VPA aggregation links and pod counts when node labels change.
+func (cluster *clusterState) SetNodes(nodes map[string]labels.Set) {
+	changed := len(nodes) != len(cluster.nodes)
+	if !changed {
+		for name, newSet := range nodes {
+			oldSet, ok := cluster.nodes[name]
+			if !ok || !maps.Equal(oldSet, newSet) {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		return
+	}
+	next := make(map[string]labels.Set, len(nodes))
+	for name, set := range nodes {
+		cloned := make(labels.Set, len(set))
+		maps.Copy(cloned, set)
+		next[name] = cloned
+	}
+	cluster.nodes = next
+	cluster.onNodesChanged()
+}
+
+// AddOrUpdateNode adds or updates a single node's labels in ClusterState.
+func (cluster *clusterState) AddOrUpdateNode(nodeName string, nodeLabels labels.Set) {
+	cloned := make(labels.Set, len(nodeLabels))
+	maps.Copy(cloned, nodeLabels)
+	if old, ok := cluster.nodes[nodeName]; ok && maps.Equal(old, cloned) {
+		return
+	}
+	cluster.nodes[nodeName] = cloned
+	cluster.onNodesChanged()
+}
+
+// DeleteNode removes a node from ClusterState.
+func (cluster *clusterState) DeleteNode(nodeName string) {
+	if _, ok := cluster.nodes[nodeName]; !ok {
+		return
+	}
+	delete(cluster.nodes, nodeName)
+	cluster.onNodesChanged()
+}
+
+func (cluster *clusterState) onNodesChanged() {
+	if !features.Enabled(features.VPANodeSelector) {
+		return
+	}
+	for aggKey, agg := range cluster.aggregateStateMap {
+		if aggKey.NodeName() == "" {
+			continue
+		}
+		for _, vpa := range cluster.vpas {
+			if !vpa.HasSelector {
+				continue
+			}
+			if vpa.matchesAggregation(aggKey) {
+				vpa.UseAggregationIfMatching(aggKey, agg)
+			} else if vpa.UsesAggregation(aggKey) {
+				vpa.DeleteAggregation(aggKey)
+			}
+		}
+		cluster.refreshAggregationController(aggKey, agg)
+	}
+	cluster.recomputePodCounts()
+}
+
+func (cluster *clusterState) recomputePodCounts() {
+	for _, vpa := range cluster.vpas {
+		vpa.PodCount = len(cluster.GetMatchingPods(vpa))
+	}
+}
+
+func (cluster *clusterState) refreshAggregationController(key AggregateStateKey, state *AggregateContainerState) {
+	if !features.Enabled(features.VPANodeSelector) {
+		return
+	}
+	var best *Vpa
+	for _, vpa := range cluster.vpas {
+		if vpa.UsesAggregation(key) && isVpaStronger(vpa, best) {
+			best = vpa
+		}
+	}
+	if best == nil {
+		state.setControllingVpa(nil)
+		state.MarkNotAutoscaled()
+		return
+	}
+	state.setControllingVpa(best)
+	state.IsUnderVPA = true
+	state.UpdateMode = best.UpdateMode
+	state.UpdateFromPolicy(vpa_utils.GetContainerResourcePolicy(key.ContainerName(), best.ResourcePolicy))
+	if rec := best.GetRecommendation(); rec != nil {
+		for _, cr := range rec.ContainerRecommendations {
+			if cr.ContainerName == key.ContainerName() {
+				state.SetLastRecommendation(cr.UncappedTarget)
+				break
+			}
+		}
+	}
+}
+
+func (cluster *clusterState) refreshAllAggregationControllers() {
+	for key, state := range cluster.aggregateStateMap {
+		cluster.refreshAggregationController(key, state)
+	}
+}
+
+func (cluster *clusterState) findOrCreateAggregateContainerStateByKey(aggregateStateKey AggregateStateKey) *AggregateContainerState {
+	aggregateContainerState, aggregateStateExists := cluster.aggregateStateMap[aggregateStateKey]
+	if !aggregateStateExists {
+		aggregateContainerState = NewAggregateContainerState()
+		cluster.aggregateStateMap[aggregateStateKey] = aggregateContainerState
+		for _, vpa := range cluster.vpas {
+			vpa.UseAggregationIfMatching(aggregateStateKey, aggregateContainerState)
+		}
+	}
+	return aggregateContainerState
+}
+
+func (cluster *clusterState) anyContainerUsesKey(target AggregateStateKey) bool {
+	for _, pod := range cluster.pods {
+		for _, key := range pod.containerAggKeys {
+			if key == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reconcilePodAggregations handles live re-keying of pod container aggregations when
+// the first selector VPA for a DaemonSet is created (0 -> 1) or the last one is deleted
+// (1 -> 0), or when a pod's labels or node change.
+func (cluster *clusterState) reconcilePodAggregations() {
+	mergedOldKeys := make(map[AggregateStateKey]bool)
+	candidateEmptyOldKeys := make(map[AggregateStateKey]bool)
+
+	for _, pod := range cluster.pods {
+		if pod.containerAggKeys == nil {
+			pod.containerAggKeys = make(map[string]AggregateStateKey)
+		}
+		for containerName, container := range pod.Containers {
+			newKey := cluster.MakeAggregateStateKey(pod, containerName)
+			oldKey, hasOldKey := pod.containerAggKeys[containerName]
+			if !hasOldKey {
+				cluster.findOrCreateAggregateContainerStateByKey(newKey)
+				pod.containerAggKeys[containerName] = newKey
+				continue
+			}
+			if oldKey == newKey {
+				continue
+			}
+			if oldKey.NodeName() != "" && newKey.NodeName() == "" {
+				// 1 -> 0 selector VPAs: merge per-node aggregations back into the shared DaemonSet aggregation.
+				sharedAgg := cluster.findOrCreateAggregateContainerStateByKey(newKey)
+				if !mergedOldKeys[oldKey] {
+					mergedOldKeys[oldKey] = true
+					if oldAgg, ok := cluster.aggregateStateMap[oldKey]; ok {
+						sharedAgg.MergeContainerState(oldAgg)
+						delete(cluster.aggregateStateMap, oldKey)
+						for _, vpa := range cluster.vpas {
+							vpa.DeleteAggregation(oldKey)
+						}
+					}
+				}
+				pod.containerAggKeys[containerName] = newKey
+				continue
+			}
+
+			// 0 -> 1 selector VPA split (or label/node update): create new aggregation and migrate ongoing memory peak.
+			newAgg := cluster.findOrCreateAggregateContainerStateByKey(newKey)
+			if oldAgg, ok := cluster.aggregateStateMap[oldKey]; ok {
+				if !container.WindowEnd.IsZero() && container.GetMaxMemoryPeak() != 0 {
+					peak := ContainerUsageSample{
+						MeasureStart: container.WindowEnd,
+						Usage:        container.GetMaxMemoryPeak(),
+						Resource:     ResourceMemory,
+					}
+					oldAgg.SubtractSample(&peak)
+					newAgg.AddSample(&peak)
+				}
+				candidateEmptyOldKeys[oldKey] = true
+			}
+			pod.containerAggKeys[containerName] = newKey
+		}
+	}
+
+	for oldKey := range candidateEmptyOldKeys {
+		if oldAgg, ok := cluster.aggregateStateMap[oldKey]; ok {
+			if !cluster.anyContainerUsesKey(oldKey) && oldAgg.isEmpty() && oldAgg.AggregateMemoryPeaks.IsEmpty() {
+				delete(cluster.aggregateStateMap, oldKey)
+				for _, vpa := range cluster.vpas {
+					vpa.DeleteAggregation(oldKey)
+				}
+			}
+		}
+	}
+}
+
+// UpdateSelectorOverlapConditions evaluates overlapping selector VPAs targeting the
+// same controller and sets or clears the SelectorOverlap condition accordingly.
+func (cluster *clusterState) UpdateSelectorOverlapConditions() {
+	if !features.Enabled(features.VPANodeSelector) {
+		for _, vpa := range cluster.vpas {
+			vpa.DeleteCondition(vpa_types.SelectorOverlap)
+		}
+		return
+	}
+
+	type targetKey struct {
+		namespace string
+		kind      string
+		name      string
+	}
+	byTarget := make(map[targetKey][]*Vpa)
+	for _, vpa := range cluster.vpas {
+		if !vpa.HasSelector || vpa.NodeSelector == nil || vpa.TargetRef == nil || vpa.PodSelector == nil {
+			vpa.DeleteCondition(vpa_types.SelectorOverlap)
+			continue
+		}
+		tk := targetKey{
+			namespace: vpa.ID.Namespace,
+			kind:      vpa.TargetRef.Kind,
+			name:      vpa.TargetRef.Name,
+		}
+		byTarget[tk] = append(byTarget[tk], vpa)
+	}
+
+	for _, selectorVPAs := range byTarget {
+		if len(selectorVPAs) <= 1 {
+			for _, vpa := range selectorVPAs {
+				vpa.DeleteCondition(vpa_types.SelectorOverlap)
+			}
+			continue
+		}
+
+		// Collect sorted unique node names running an active pod of this target controller.
+		nodeSet := make(map[string]bool)
+		rep := selectorVPAs[0]
+		for _, pod := range cluster.pods {
+			if pod.NodeName == "" || pod.Phase == corev1.PodSucceeded || pod.Phase == corev1.PodFailed {
+				continue
+			}
+			if _, nodeKnown := cluster.nodes[pod.NodeName]; !nodeKnown {
+				continue
+			}
+			if vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, cluster.labelSetMap[pod.labelSetKey], rep.ID.Namespace, rep.PodSelector) {
+				nodeSet[pod.NodeName] = true
+			}
+		}
+		podNodes := make([]string, 0, len(nodeSet))
+		for n := range nodeSet {
+			podNodes = append(podNodes, n)
+		}
+		slices.Sort(podNodes)
+
+		for _, v := range selectorVPAs {
+			var matchedNodes []string
+			for _, nodeName := range podNodes {
+				if v.NodeSelector.Matches(cluster.nodes[nodeName]) {
+					matchedNodes = append(matchedNodes, nodeName)
+				}
+			}
+			lostByWinner := make(map[VpaID][]string)
+			lostCount := 0
+			for _, nodeName := range matchedNodes {
+				nodeLabels := cluster.nodes[nodeName]
+				var winner *Vpa
+				for _, other := range selectorVPAs {
+					if other.NodeSelector.Matches(nodeLabels) && isVpaStronger(other, winner) {
+						winner = other
+					}
+				}
+				if winner != nil && winner.ID != v.ID {
+					lostByWinner[winner.ID] = append(lostByWinner[winner.ID], nodeName)
+					lostCount++
+				}
+			}
+			if lostCount == 0 {
+				v.DeleteCondition(vpa_types.SelectorOverlap)
+				continue
+			}
+			winnerIDs := make([]VpaID, 0, len(lostByWinner))
+			for wID := range lostByWinner {
+				winnerIDs = append(winnerIDs, wID)
+			}
+			slices.SortFunc(winnerIDs, func(a, b VpaID) int {
+				if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
+					return c
+				}
+				return cmp.Compare(a.VpaName, b.VpaName)
+			})
+			parts := make([]string, 0, len(winnerIDs))
+			for _, wID := range winnerIDs {
+				parts = append(parts, fmt.Sprintf("VPA %s/%s: %s", wID.Namespace, wID.VpaName, strings.Join(lostByWinner[wID], ", ")))
+			}
+			verb := "are"
+			if lostCount == 1 {
+				verb = "is"
+			}
+			msg := fmt.Sprintf("%d of %d nodes %s controlled by %s", lostCount, len(matchedNodes), verb, strings.Join(parts, "; "))
+			v.SetCondition(vpa_types.SelectorOverlap, true, "LostTieBreak", msg)
+		}
 	}
 }
 
@@ -379,11 +826,16 @@ func (cluster *clusterState) getLabelSetKey(labelSet labels.Set) labelSetKey {
 // MakeAggregateStateKey returns the AggregateStateKey that should be used
 // to aggregate usage samples from a container with the given name in a given pod.
 func (cluster *clusterState) MakeAggregateStateKey(pod *PodState, containerName string) AggregateStateKey {
+	nodeName := ""
+	if cluster.shouldKeyByNode(pod) {
+		nodeName = pod.NodeName
+	}
 	return aggregateStateKey{
 		namespace:     pod.ID.Namespace,
 		containerName: containerName,
 		labelSetKey:   pod.labelSetKey,
 		labelSetMap:   &cluster.labelSetMap,
+		nodeName:      nodeName,
 	}
 }
 
@@ -402,16 +854,7 @@ func (cluster *clusterState) aggregateStateKeyForContainerID(containerID Contain
 // The pod with the corresponding PodID must already be present in the clusterState.
 func (cluster *clusterState) findOrCreateAggregateContainerState(containerID ContainerID) *AggregateContainerState {
 	aggregateStateKey := cluster.aggregateStateKeyForContainerID(containerID)
-	aggregateContainerState, aggregateStateExists := cluster.aggregateStateMap[aggregateStateKey]
-	if !aggregateStateExists {
-		aggregateContainerState = NewAggregateContainerState()
-		cluster.aggregateStateMap[aggregateStateKey] = aggregateContainerState
-		// Link the new aggregation to the existing VPAs.
-		for _, vpa := range cluster.vpas {
-			vpa.UseAggregationIfMatching(aggregateStateKey, aggregateContainerState)
-		}
-	}
-	return aggregateContainerState
+	return cluster.findOrCreateAggregateContainerStateByKey(aggregateStateKey)
 }
 
 // garbageCollectAggregateCollectionStates removes obsolete AggregateCollectionStates from the clusterState.
@@ -512,8 +955,7 @@ func (cluster *clusterState) RecordRecommendation(vpa *Vpa, now time.Time) error
 func (cluster *clusterState) GetMatchingPods(vpa *Vpa) []PodID {
 	matchingPods := []PodID{}
 	for podID, pod := range cluster.pods {
-		if vpa_utils.PodLabelsMatchVPA(podID.Namespace, cluster.labelSetMap[pod.labelSetKey],
-			vpa.ID.Namespace, vpa.PodSelector) {
+		if cluster.podMatchesVPA(pod, vpa) {
 			matchingPods = append(matchingPods, podID)
 		}
 	}
@@ -523,7 +965,7 @@ func (cluster *clusterState) GetMatchingPods(vpa *Vpa) []PodID {
 // GetControllerForPodUnderVPA returns controller associated with given Pod. Returns nil if Pod is not controlled by a VPA object.
 func (cluster *clusterState) GetControllerForPodUnderVPA(ctx context.Context, pod *PodState, controllerFetcher controllerfetcher.ControllerFetcher) *controllerfetcher.ControllerKeyWithAPIVersion {
 	controllingVPA := cluster.GetControllingVPA(pod)
-	if controllingVPA != nil {
+	if controllingVPA != nil && controllingVPA.TargetRef != nil {
 		controller := &controllerfetcher.ControllerKeyWithAPIVersion{
 			ControllerKey: controllerfetcher.ControllerKey{
 				Namespace: controllingVPA.ID.Namespace,
@@ -540,13 +982,13 @@ func (cluster *clusterState) GetControllerForPodUnderVPA(ctx context.Context, po
 
 // GetControllingVPA returns a VPA object controlling given Pod.
 func (cluster *clusterState) GetControllingVPA(pod *PodState) *Vpa {
+	var controlling *Vpa
 	for _, vpa := range cluster.vpas {
-		if vpa_utils.PodLabelsMatchVPA(pod.ID.Namespace, cluster.labelSetMap[pod.labelSetKey],
-			vpa.ID.Namespace, vpa.PodSelector) {
-			return vpa
+		if cluster.podMatchesVPA(pod, vpa) && isVpaStronger(vpa, controlling) {
+			controlling = vpa
 		}
 	}
-	return nil
+	return controlling
 }
 
 // Implementation of the AggregateStateKey interface. It can be used as a map key.
@@ -557,6 +999,7 @@ type aggregateStateKey struct {
 	// Pointer to the global map from labelSetKey to labels.Set.
 	// Note: a pointer is used so that two copies of the same key are equal.
 	labelSetMap *labelSetMap
+	nodeName    string
 }
 
 // Namespace returns the namespace for the aggregateStateKey.
@@ -575,4 +1018,9 @@ func (k aggregateStateKey) Labels() labels.Labels {
 		return labels.Set{}
 	}
 	return (*k.labelSetMap)[k.labelSetKey]
+}
+
+// NodeName returns the node name for the aggregateStateKey, or "" when shared across nodes.
+func (k aggregateStateKey) NodeName() string {
+	return k.nodeName
 }

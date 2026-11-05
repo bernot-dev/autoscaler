@@ -27,10 +27,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/ptr"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	vpa_fake "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/fake"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 )
@@ -910,6 +912,163 @@ func TestGetBoostRemainingDuration(t *testing.T) {
 				assert.GreaterOrEqual(t, result, tc.expectRange[0], "remaining duration should be >= lower bound")
 				assert.LessOrEqual(t, result, tc.expectRange[1], "remaining duration should be <= upper bound")
 			}
+		})
+	}
+}
+
+func TestStrongerWithSelector(t *testing.T) {
+	olderPlain := test.VerticalPodAutoscaler().
+		WithName("vpa-plain").
+		WithContainer(containerName).
+		WithCreationTimestamp(time.Unix(10, 0)).
+		Get()
+	newerSelector := test.VerticalPodAutoscaler().
+		WithName("vpa-selector").
+		WithContainer(containerName).
+		WithCreationTimestamp(time.Unix(20, 0)).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).
+		Get()
+	olderSelector := test.VerticalPodAutoscaler().
+		WithName("vpa-selector-older").
+		WithContainer(containerName).
+		WithCreationTimestamp(time.Unix(15, 0)).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"zone": "a"}}).
+		Get()
+
+	t.Run("feature gate enabled: selector beats older plain VPA, timestamp breaks ties among selectors", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+		assert.True(t, Stronger(newerSelector, olderPlain))
+		assert.False(t, Stronger(olderPlain, newerSelector))
+		assert.True(t, Stronger(olderSelector, newerSelector))
+		assert.False(t, Stronger(newerSelector, olderSelector))
+	})
+
+	t.Run("feature gate disabled: falls back to timestamp order", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, false)
+		assert.True(t, Stronger(olderPlain, newerSelector))
+		assert.False(t, Stronger(newerSelector, olderPlain))
+	})
+}
+
+func TestNodeLabelsMatchVPA(t *testing.T) {
+	gpuVPA := test.VerticalPodAutoscaler().
+		WithName("vpa-gpu").
+		WithContainer(containerName).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).
+		Get()
+	plainVPA := test.VerticalPodAutoscaler().WithName("vpa-plain").WithContainer(containerName).Get()
+
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+	assert.True(t, NodeLabelsMatchVPA(labels.Set{"pool": "gpu", "zone": "a"}, gpuVPA))
+	assert.False(t, NodeLabelsMatchVPA(labels.Set{"pool": "cpu"}, gpuVPA))
+	assert.True(t, NodeLabelsMatchVPA(labels.Set{"pool": "cpu"}, plainVPA))
+
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, false)
+	assert.True(t, NodeLabelsMatchVPA(labels.Set{"pool": "cpu"}, gpuVPA))
+}
+
+func TestNodeNameForPod(t *testing.T) {
+	daemonSetAffinity := func(terms ...corev1.NodeSelectorTerm) *corev1.Affinity {
+		return &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: terms,
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name           string
+		pod            *corev1.Pod
+		controllerKind string
+		wantNode       string
+		wantOK         bool
+	}{
+		{
+			name:           "scheduled pod uses spec.nodeName",
+			pod:            test.Pod().WithName("p1").WithNodeName("node-1").Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "node-1",
+			wantOK:         true,
+		},
+		{
+			name: "unscheduled DaemonSet pod uses single-term metadata.name matchFields",
+			pod: test.Pod().WithName("p2").WithAffinity(daemonSetAffinity(corev1.NodeSelectorTerm{
+				MatchFields: []corev1.NodeSelectorRequirement{
+					{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-2"}},
+				},
+			})).Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "node-2",
+			wantOK:         true,
+		},
+		{
+			name: "unscheduled DaemonSet pod with multiple nodeSelectorTerms all bound to same node",
+			pod: test.Pod().WithName("p3").WithAffinity(daemonSetAffinity(
+				corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}},
+					MatchFields:      []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-3"}}},
+				},
+				corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}},
+					MatchFields:      []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-3"}}},
+				},
+			)).Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "node-3",
+			wantOK:         true,
+		},
+		{
+			name: "non-DaemonSet pod ignores nodeAffinity",
+			pod: test.Pod().WithName("p4").WithAffinity(daemonSetAffinity(corev1.NodeSelectorTerm{
+				MatchFields: []corev1.NodeSelectorRequirement{
+					{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-4"}},
+				},
+			})).Get(),
+			controllerKind: "Deployment",
+			wantNode:       "",
+			wantOK:         false,
+		},
+		{
+			name:           "DaemonSet pod without affinity",
+			pod:            test.Pod().WithName("p5").Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "",
+			wantOK:         false,
+		},
+		{
+			name: "DaemonSet pod with multi-value metadata.name matchFields",
+			pod: test.Pod().WithName("p6").WithAffinity(daemonSetAffinity(corev1.NodeSelectorTerm{
+				MatchFields: []corev1.NodeSelectorRequirement{
+					{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-1", "node-2"}},
+				},
+			})).Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "",
+			wantOK:         false,
+		},
+		{
+			name: "DaemonSet pod with disagreeing terms",
+			pod: test.Pod().WithName("p7").WithAffinity(daemonSetAffinity(
+				corev1.NodeSelectorTerm{
+					MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-1"}}},
+				},
+				corev1.NodeSelectorTerm{
+					MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-2"}}},
+				},
+			)).Get(),
+			controllerKind: "DaemonSet",
+			wantNode:       "",
+			wantOK:         false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotNode, gotOK := NodeNameForPod(tc.pod, tc.controllerKind)
+			assert.Equal(t, tc.wantOK, gotOK)
+			assert.Equal(t, tc.wantNode, gotNode)
 		})
 	}
 }

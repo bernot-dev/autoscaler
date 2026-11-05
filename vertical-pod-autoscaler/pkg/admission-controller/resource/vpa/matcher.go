@@ -20,6 +20,7 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -39,19 +40,32 @@ type matcher struct {
 	vpaIndexer        cache.Indexer
 	selectorFetcher   target.VpaTargetSelectorFetcher
 	controllerFetcher controllerfetcher.ControllerFetcher
+	nodeLister        listersv1.NodeLister
 }
 
 // NewMatcher returns a new VPA matcher.
 func NewMatcher(vpaIndexer cache.Indexer,
 	selectorFetcher target.VpaTargetSelectorFetcher,
 	controllerFetcher controllerfetcher.ControllerFetcher) Matcher {
-	return &matcher{vpaIndexer: vpaIndexer,
+	return NewMatcherWithNodeLister(vpaIndexer, selectorFetcher, controllerFetcher, nil)
+}
+
+// NewMatcherWithNodeLister returns a new VPA matcher with a NodeLister for node-scoped VPAs.
+func NewMatcherWithNodeLister(vpaIndexer cache.Indexer,
+	selectorFetcher target.VpaTargetSelectorFetcher,
+	controllerFetcher controllerfetcher.ControllerFetcher,
+	nodeLister listersv1.NodeLister) Matcher {
+	return &matcher{
+		vpaIndexer:        vpaIndexer,
 		selectorFetcher:   selectorFetcher,
-		controllerFetcher: controllerFetcher}
+		controllerFetcher: controllerFetcher,
+		nodeLister:        nodeLister,
+	}
 }
 
 func (m *matcher) GetMatchingVPA(ctx context.Context, pod *corev1.Pod) *vpa_types.VerticalPodAutoscaler {
-	finder := vpa_api_util.NewControllingVPAFinder(m.vpaIndexer, m.selectorFetcher, m.controllerFetcher, admitsPods)
+	finder := vpa_api_util.NewControllingVPAFinderWithNodeLister(
+		m.vpaIndexer, m.selectorFetcher, m.controllerFetcher, admitsPods, m.nodeLister)
 	vpa, _ := finder.GetControllingVPAForPod(ctx, pod)
 	return vpa
 }

@@ -61,6 +61,13 @@ const (
 	// InPlace enables the InPlace update mode to be used.
 	// Requires KEP-1287 InPlacePodVerticalScaling feature-gate to be enabled on the cluster.
 	InPlace featuregate.Feature = "InPlace"
+
+	// alpha: v1.9.0
+	// components: admission-controller, recommender, updater
+
+	// VPANodeSelector enables scoping a VPA to a subset of its target DaemonSet's pods
+	// selected by node labels via spec.selector.nodeSelector.
+	VPANodeSelector featuregate.Feature = "VPANodeSelector"
 )
 
 // MutableFeatureGate is a mutable, versioned, global FeatureGate.

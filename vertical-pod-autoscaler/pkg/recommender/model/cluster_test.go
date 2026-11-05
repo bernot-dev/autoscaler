@@ -27,9 +27,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 )
@@ -958,4 +960,189 @@ func TestVPAWithMatchingPods(t *testing.T) {
 			assert.Equal(t, tc.expectedMatch, cluster.vpas[vpa.ID].PodCount)
 		})
 	}
+}
+
+func TestNodeScopedVPAAggregationReKeyingAndFallback(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+
+	cluster := NewClusterState(testGcPeriod)
+	cluster.SetNodes(map[string]labels.Set{
+		"node-gpu": {"pool": "gpu"},
+		"node-cpu": {"pool": "cpu"},
+	})
+
+	dsRef := &autoscalingv1.CrossVersionObjectReference{Kind: "DaemonSet", Name: "ds-agent", APIVersion: "apps/v1"}
+	podLabels := labels.Set{"app": "agent"}
+	podSelector, err := labels.Parse("app = agent")
+	assert.NoError(t, err)
+
+	podGPU := PodID{Namespace: "default", PodName: "pod-gpu"}
+	podCPU := PodID{Namespace: "default", PodName: "pod-cpu"}
+	cGPU := ContainerID{PodID: podGPU, ContainerName: "c1"}
+	cCPU := ContainerID{PodID: podCPU, ContainerName: "c1"}
+
+	// Start with plain fallback VPA only: both DaemonSet pods share a single AggregateContainerState.
+	fallbackCRD := test.VerticalPodAutoscaler().WithName("vpa-fallback").WithNamespace("default").
+		WithContainer("c1").WithCreationTimestamp(time.Unix(1, 0)).WithUpdateMode(vpa_types.UpdateModeRecreate).
+		WithTargetRef(dsRef).Get()
+	assert.NoError(t, cluster.AddOrUpdateVpa(fallbackCRD, podSelector))
+
+	cluster.AddOrUpdatePodWithNode(podGPU, podLabels, corev1.PodRunning, "node-gpu")
+	cluster.AddOrUpdatePodWithNode(podCPU, podLabels, corev1.PodRunning, "node-cpu")
+	assert.NoError(t, cluster.AddOrUpdateContainer(cGPU, testRequest))
+	assert.NoError(t, cluster.AddOrUpdateContainer(cCPU, testRequest))
+
+	assert.Equal(t, 1, cluster.StateMapSize(), "DaemonSet without selector VPA must use 1 shared aggregate")
+	assert.Equal(t, "", cluster.MakeAggregateStateKey(cluster.pods[podGPU], "c1").NodeName())
+
+	// Record ongoing memory peaks before any selector VPA exists.
+	t0 := time.Unix(1000, 0)
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container:            cGPU,
+		ContainerUsageSample: ContainerUsageSample{MeasureStart: t0, Usage: MemoryAmountFromBytes(800 * 1024 * 1024), Resource: ResourceMemory},
+	}))
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container:            cCPU,
+		ContainerUsageSample: ContainerUsageSample{MeasureStart: t0, Usage: MemoryAmountFromBytes(100 * 1024 * 1024), Resource: ResourceMemory},
+	}))
+
+	// 0 -> 1 transition: add selector VPA for pool=gpu (UpdateMode: Off, ScalingMode: Off).
+	gpuCRD := test.VerticalPodAutoscaler().WithName("vpa-gpu").WithNamespace("default").
+		WithContainer("c1").WithCreationTimestamp(time.Unix(10, 0)).WithUpdateMode(vpa_types.UpdateModeOff).
+		WithScalingMode("c1", vpa_types.ContainerScalingModeOff).
+		WithTargetRef(dsRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).Get()
+	assert.NoError(t, cluster.AddOrUpdateVpa(gpuCRD, podSelector))
+
+	assert.Equal(t, 2, cluster.StateMapSize(), "0 -> 1 selector VPA must split into 2 per-node aggregates")
+	keyGPU := cluster.MakeAggregateStateKey(cluster.pods[podGPU], "c1")
+	keyCPU := cluster.MakeAggregateStateKey(cluster.pods[podCPU], "c1")
+	assert.Equal(t, "node-gpu", keyGPU.NodeName())
+	assert.Equal(t, "node-cpu", keyCPU.NodeName())
+
+	vpaFallback := cluster.VPAs()[VpaID{Namespace: "default", VpaName: "vpa-fallback"}]
+	vpaGPU := cluster.VPAs()[VpaID{Namespace: "default", VpaName: "vpa-gpu"}]
+
+	assert.True(t, vpaGPU.UsesAggregation(keyGPU))
+	assert.False(t, vpaGPU.UsesAggregation(keyCPU))
+	assert.Equal(t, 1, vpaGPU.PodCount)
+
+	assert.True(t, vpaFallback.UsesAggregation(keyGPU))
+	assert.True(t, vpaFallback.UsesAggregation(keyCPU))
+	assert.Equal(t, 2, vpaFallback.PodCount)
+
+	// Controlling VPA metadata: keyGPU is controlled by vpa-gpu (Off), NOT overwritten by vpa-fallback (Recreate).
+	aggGPU := cluster.aggregateStateMap[keyGPU]
+	aggCPU := cluster.aggregateStateMap[keyCPU]
+	assert.Equal(t, vpa_types.UpdateModeOff, *aggGPU.GetUpdateMode())
+	assert.Equal(t, vpa_types.ContainerScalingModeOff, *aggGPU.GetScalingMode())
+	assert.Equal(t, vpa_types.UpdateModeRecreate, *aggCPU.GetUpdateMode())
+	assert.Equal(t, vpa_types.ContainerScalingModeAuto, *aggCPU.GetScalingMode())
+	assert.Equal(t, vpaGPU, cluster.GetControllingVPA(cluster.pods[podGPU]))
+	assert.Equal(t, vpaFallback, cluster.GetControllingVPA(cluster.pods[podCPU]))
+
+	// Add CPU samples post-split and verify higher memory peak in same window subtracts cleanly without underflow.
+	t1 := t0.Add(time.Minute)
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container:            cGPU,
+		ContainerUsageSample: ContainerUsageSample{MeasureStart: t1, Usage: CPUAmountFromCores(2.0), Resource: ResourceCPU},
+	}))
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container:            cCPU,
+		ContainerUsageSample: ContainerUsageSample{MeasureStart: t1, Usage: CPUAmountFromCores(0.1), Resource: ResourceCPU},
+	}))
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container:            cGPU,
+		ContainerUsageSample: ContainerUsageSample{MeasureStart: t1, Usage: MemoryAmountFromBytes(900 * 1024 * 1024), Resource: ResourceMemory},
+	}))
+
+	gpuMerged := vpaGPU.AggregateStateByContainerName()["c1"]
+	fallbackMergedBeforeDelete := vpaFallback.AggregateStateByContainerName()["c1"]
+	assert.Equal(t, 1, gpuMerged.TotalSamplesCount)
+	assert.Equal(t, 2, fallbackMergedBeforeDelete.TotalSamplesCount)
+	assert.Greater(t, gpuMerged.AggregateCPUUsage.Percentile(0.9), 1.5)
+
+	// Relabeling node-gpu -> pool=cpu unlinks vpa-gpu and promotes vpa-fallback as controller of aggGPU.
+	cluster.AddOrUpdateNode("node-gpu", labels.Set{"pool": "cpu"})
+	assert.False(t, vpaGPU.UsesAggregation(keyGPU))
+	assert.Equal(t, 0, vpaGPU.PodCount)
+	assert.Equal(t, vpa_types.UpdateModeRecreate, *aggGPU.GetUpdateMode())
+	assert.Equal(t, vpa_types.ContainerScalingModeAuto, *aggGPU.GetScalingMode())
+
+	// Restore label pool=gpu, then test 1 -> 0 transition on deleting vpa-gpu.
+	cluster.AddOrUpdateNode("node-gpu", labels.Set{"pool": "gpu"})
+	assert.True(t, vpaGPU.UsesAggregation(keyGPU))
+	assert.Equal(t, 1, vpaGPU.PodCount)
+
+	assert.NoError(t, cluster.DeleteVpa(vpaGPU.ID))
+	assert.Equal(t, 1, cluster.StateMapSize(), "1 -> 0 selector VPA deletion must merge back to 1 shared aggregate")
+	fallbackMergedAfterDelete := vpaFallback.AggregateStateByContainerName()["c1"]
+	assert.Equal(t, fallbackMergedBeforeDelete.TotalSamplesCount, fallbackMergedAfterDelete.TotalSamplesCount)
+	assert.InDelta(t,
+		fallbackMergedBeforeDelete.AggregateCPUUsage.Percentile(0.9),
+		fallbackMergedAfterDelete.AggregateCPUUsage.Percentile(0.9),
+		1e-9,
+	)
+	assert.InDelta(t,
+		fallbackMergedBeforeDelete.AggregateMemoryPeaks.Percentile(0.9),
+		fallbackMergedAfterDelete.AggregateMemoryPeaks.Percentile(0.9),
+		1e-9,
+	)
+}
+
+func TestSelectorOverlapConditions(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+
+	cluster := NewClusterState(testGcPeriod)
+	cluster.SetNodes(map[string]labels.Set{
+		"node-1": {"pool": "gpu"},
+		"node-2": {"pool": "gpu"},
+		"node-3": {"pool": "gpu", "zone": "a"},
+		"node-4": {"zone": "a"},
+		"node-5": {"zone": "a"},
+	})
+
+	dsRef := &autoscalingv1.CrossVersionObjectReference{Kind: "DaemonSet", Name: "ds-agent", APIVersion: "apps/v1"}
+	podLabels := labels.Set{"app": "agent"}
+	podSelector, err := labels.Parse("app = agent")
+	assert.NoError(t, err)
+
+	for i := 1; i <= 5; i++ {
+		nodeName := fmt.Sprintf("node-%d", i)
+		podID := PodID{Namespace: "default", PodName: fmt.Sprintf("pod-%d", i)}
+		cluster.AddOrUpdatePodWithNode(podID, podLabels, corev1.PodRunning, nodeName)
+		assert.NoError(t, cluster.AddOrUpdateContainer(ContainerID{PodID: podID, ContainerName: "c1"}, testRequest))
+	}
+
+	// Plain VPA + older VPA gpu (nodes 1-3) + newer VPA zone-a (nodes 3-5).
+	plainCRD := test.VerticalPodAutoscaler().WithName("plain").WithNamespace("default").
+		WithContainer("c1").WithCreationTimestamp(time.Unix(1, 0)).WithTargetRef(dsRef).Get()
+	gpuCRD := test.VerticalPodAutoscaler().WithName("gpu").WithNamespace("default").
+		WithContainer("c1").WithCreationTimestamp(time.Unix(10, 0)).WithTargetRef(dsRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).Get()
+	zoneACRD := test.VerticalPodAutoscaler().WithName("zone-a").WithNamespace("default").
+		WithContainer("c1").WithCreationTimestamp(time.Unix(20, 0)).WithTargetRef(dsRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"zone": "a"}}).Get()
+
+	assert.NoError(t, cluster.AddOrUpdateVpa(plainCRD, podSelector))
+	assert.NoError(t, cluster.AddOrUpdateVpa(gpuCRD, podSelector))
+	assert.NoError(t, cluster.AddOrUpdateVpa(zoneACRD, podSelector))
+
+	cluster.UpdateSelectorOverlapConditions()
+
+	plainVPA := cluster.VPAs()[VpaID{Namespace: "default", VpaName: "plain"}]
+	gpuVPA := cluster.VPAs()[VpaID{Namespace: "default", VpaName: "gpu"}]
+	zoneAVPA := cluster.VPAs()[VpaID{Namespace: "default", VpaName: "zone-a"}]
+
+	assert.False(t, plainVPA.ConditionActive(vpa_types.SelectorOverlap))
+	assert.False(t, gpuVPA.ConditionActive(vpa_types.SelectorOverlap))
+	assert.True(t, zoneAVPA.ConditionActive(vpa_types.SelectorOverlap))
+	cond := zoneAVPA.GetConditionsMap()[vpa_types.SelectorOverlap]
+	assert.Equal(t, "LostTieBreak", cond.Reason)
+	assert.Equal(t, "1 of 3 nodes is controlled by VPA default/gpu: node-3", cond.Message)
+
+	// Removing zone=a from node-3 eliminates the overlap and clears the condition.
+	cluster.AddOrUpdateNode("node-3", labels.Set{"pool": "gpu"})
+	cluster.UpdateSelectorOverlapConditions()
+	assert.False(t, zoneAVPA.ConditionActive(vpa_types.SelectorOverlap))
 }

@@ -405,6 +405,24 @@ _Appears in:_
 | `name` _string_ | Name of the recommender responsible for generating recommendation for this object. |  |  |
 
 
+#### VerticalPodAutoscalerSelector
+
+
+
+VerticalPodAutoscalerSelector selects a subset of the pods controlled by
+the VPA's TargetRef. Pods must match all of the specified selectors.
+
+_Validation:_
+- MinProperties: 1
+
+_Appears in:_
+- [VerticalPodAutoscalerSpec](#verticalpodautoscalerspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `nodeSelector` _[LabelSelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#labelselector-v1-meta)_ | nodeSelector selects pods by the labels of the node they run on.<br />A pod is selected if its node's labels match the selector.<br />In this iteration it is only allowed when TargetRef is a DaemonSet. |  | Optional: \{\} <br /> |
+
+
 #### VerticalPodAutoscalerSpec
 
 
@@ -423,6 +441,7 @@ _Appears in:_
 | `resourcePolicy` _[PodResourcePolicy](#podresourcepolicy)_ | Controls how the autoscaler computes recommended resources.<br />The resource policy may be used to set constraints on the recommendations<br />for individual containers.<br />If any individual containers need to be excluded from getting the VPA recommendations, then<br />it must be disabled explicitly by setting mode to "Off" under containerPolicies.<br />If not specified, the autoscaler computes recommended resources for all containers in the pod,<br />without additional constraints. |  | Optional: \{\} <br /> |
 | `recommenders` _[VerticalPodAutoscalerRecommenderSelector](#verticalpodautoscalerrecommenderselector) array_ | Recommender responsible for generating recommendation for this object.<br />List should be empty (then the default recommender will generate the<br />recommendation) or contain exactly one recommender. |  | Optional: \{\} <br /> |
 | `startupBoost` _[StartupBoost](#startupboost)_ | startupBoost specifies the startup boost policy for the pod. |  | Optional: \{\} <br /> |
+| `selector` _[VerticalPodAutoscalerSelector](#verticalpodautoscalerselector)_ | selector further restricts the set of pods, among those controlled by<br />TargetRef, that this VPA applies to. When unset, the VPA applies to all<br />pods controlled by TargetRef (current behavior).<br />Recommendations are computed only from the selected pods, and only the<br />selected pods are updated by the updater and admission controller. |  | MinProperties: 1 <br />Optional: \{\} <br /> |
 
 
 #### VerticalPodAutoscalerStatus

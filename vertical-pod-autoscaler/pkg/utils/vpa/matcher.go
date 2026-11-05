@@ -21,10 +21,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 )
@@ -46,7 +48,8 @@ type ControllingVPAFinder struct {
 	selectorFetcher   target.VpaTargetSelectorFetcher
 	controllerFetcher controllerfetcher.ControllerFetcher
 	// filter is optional; a nil filter accepts every VPA.
-	filter VPAFilter
+	filter     VPAFilter
+	nodeLister listersv1.NodeLister
 }
 
 // NewControllingVPAFinder returns a ControllingVPAFinder looking up VPAs in
@@ -54,18 +57,26 @@ type ControllingVPAFinder struct {
 // accepted by filter are considered; a nil filter accepts every VPA.
 func NewControllingVPAFinder(vpaIndexer cache.Indexer, selectorFetcher target.VpaTargetSelectorFetcher,
 	controllerFetcher controllerfetcher.ControllerFetcher, filter VPAFilter) *ControllingVPAFinder {
+	return NewControllingVPAFinderWithNodeLister(vpaIndexer, selectorFetcher, controllerFetcher, filter, nil)
+}
+
+// NewControllingVPAFinderWithNodeLister is like NewControllingVPAFinder, additionally accepting
+// a NodeLister so node-scoped VPAs (spec.selector.nodeSelector) can match target node labels.
+func NewControllingVPAFinderWithNodeLister(vpaIndexer cache.Indexer, selectorFetcher target.VpaTargetSelectorFetcher,
+	controllerFetcher controllerfetcher.ControllerFetcher, filter VPAFilter, nodeLister listersv1.NodeLister) *ControllingVPAFinder {
 	return &ControllingVPAFinder{
 		vpaIndexer:        vpaIndexer,
 		selectorFetcher:   selectorFetcher,
 		controllerFetcher: controllerFetcher,
 		filter:            filter,
+		nodeLister:        nodeLister,
 	}
 }
 
 // GetControllingVPAForPod returns the strongest (see Stronger) VPA that targets
 // the Pod's parent controller, is accepted by the filter and whose selector
-// matches the Pod's labels, along with that selector. Returns a nil VPA if
-// there is no such VPA.
+// matches the Pod's labels (and node labels when VPANodeSelector is enabled),
+// along with that selector. Returns a nil VPA if there is no such VPA.
 func (f *ControllingVPAFinder) GetControllingVPAForPod(ctx context.Context, pod *corev1.Pod) (*vpa_types.VerticalPodAutoscaler, labels.Selector) {
 	parentController, err := FindParentControllerForPod(ctx, pod, f.controllerFetcher)
 	if err != nil {
@@ -83,6 +94,36 @@ func (f *ControllingVPAFinder) GetControllingVPAForPod(ctx context.Context, pod 
 		return nil, nil
 	}
 
+	nodeSelectorEnabled := features.Enabled(features.VPANodeSelector)
+	hasSelectorCandidate := false
+	if nodeSelectorEnabled {
+		for _, obj := range candidates {
+			if vpa, ok := obj.(*vpa_types.VerticalPodAutoscaler); ok && HasSelector(vpa) {
+				hasSelectorCandidate = true
+				break
+			}
+		}
+	}
+
+	var nodeLabels labels.Set
+	if hasSelectorCandidate {
+		nodeName, ok := NodeNameForPod(pod, parentController.Kind)
+		if !ok {
+			klog.InfoS("Warning: cannot determine target node for pod targeted by selector VPA; leaving pod unchanged", "pod", klog.KObj(pod), "controller", parentController)
+			return nil, nil
+		}
+		if f.nodeLister == nil {
+			klog.InfoS("Warning: node lister unavailable while selector VPA targets pod controller; leaving pod unchanged", "pod", klog.KObj(pod), "node", nodeName)
+			return nil, nil
+		}
+		node, err := f.nodeLister.Get(nodeName)
+		if err != nil {
+			klog.InfoS("Warning: target node not found in cache while selector VPA targets pod controller; leaving pod unchanged", "pod", klog.KObj(pod), "node", nodeName, "err", err)
+			return nil, nil
+		}
+		nodeLabels = labels.Set(node.GetLabels())
+	}
+
 	podLabels := labels.Set(pod.GetLabels())
 	var controlling *vpa_types.VerticalPodAutoscaler
 	var controllingSelector labels.Selector
@@ -92,11 +133,18 @@ func (f *ControllingVPAFinder) GetControllingVPAForPod(ctx context.Context, pod 
 			klog.ErrorS(nil, "Unexpected object type in VPA cache", "object", obj)
 			continue
 		}
-		if f.filter != nil && !f.filter(vpa) {
+		// Plain VPAs rejected by filter (e.g. dry-run Off VPAs) are skipped up front.
+		// Selector VPAs participate in precedence resolution even when rejected by filter
+		// (e.g. Off or Initial mode) so they claim their node partition and prevent a
+		// weaker fallback or overlapping VPA from hijacking those pods.
+		if f.filter != nil && !f.filter(vpa) && !(nodeSelectorEnabled && HasSelector(vpa)) {
 			continue
 		}
 		// Check strength before fetching the selector, as fetching may be expensive.
 		if !Stronger(vpa, controlling) {
+			continue
+		}
+		if hasSelectorCandidate && !NodeLabelsMatchVPA(nodeLabels, vpa) {
 			continue
 		}
 		selector, err := f.selectorFetcher.Fetch(ctx, vpa)
@@ -107,6 +155,9 @@ func (f *ControllingVPAFinder) GetControllingVPAForPod(ctx context.Context, pod 
 		if PodLabelsMatchVPA(pod.Namespace, podLabels, vpa.Namespace, selector) {
 			controlling, controllingSelector = vpa, selector
 		}
+	}
+	if controlling != nil && f.filter != nil && !f.filter(controlling) {
+		return nil, nil
 	}
 	return controlling, controllingSelector
 }

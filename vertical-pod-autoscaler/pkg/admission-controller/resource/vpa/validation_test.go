@@ -25,6 +25,7 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/ptr"
@@ -1485,5 +1486,212 @@ func TestVeryInvalidateVPA(t *testing.T) {
 	assert.Len(t, errs, 8)
 	for _, err := range errs {
 		assert.Contains(t, expectFieldErrors, err.Field)
+	}
+}
+
+func TestAllowVPANodeSelector(t *testing.T) {
+	vpaWithSelector := &vpa_types.VerticalPodAutoscaler{
+		Spec: vpa_types.VerticalPodAutoscalerSpec{
+			Selector: &vpa_types.VerticalPodAutoscalerSelector{
+				NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			},
+		},
+	}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, false)
+	assert.False(t, allowVPANodeSelector(nil))
+	assert.False(t, allowVPANodeSelector(&vpa_types.VerticalPodAutoscaler{}))
+	assert.True(t, allowVPANodeSelector(vpaWithSelector))
+
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+	assert.True(t, allowVPANodeSelector(nil))
+	assert.True(t, allowVPANodeSelector(&vpa_types.VerticalPodAutoscaler{}))
+}
+
+func TestValidateVPASelector(t *testing.T) {
+	dsRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       "DaemonSet",
+		Name:       "my-ds",
+		APIVersion: "apps/v1",
+	}
+	deployRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       "Deployment",
+		Name:       "my-deploy",
+		APIVersion: "apps/v1",
+	}
+	validFactor := int32(2)
+
+	tests := []struct {
+		name        string
+		vpa         vpa_types.VerticalPodAutoscaler
+		opts        VPAValidationOptions
+		wantErrSub  string
+		wantErrPath string
+	}{
+		{
+			name: "valid selector on DaemonSet with feature gate enabled",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+					},
+				},
+			},
+			opts: VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+		},
+		{
+			name: "valid matchExpressions selector on DaemonSet",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{Key: "pool", Operator: metav1.LabelSelectorOpIn, Values: []string{"gpu"}},
+							},
+						},
+					},
+				},
+			},
+			opts: VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+		},
+		{
+			name: "rejected when VPANodeSelector feature gate is disabled",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: false},
+			wantErrPath: "spec.selector.nodeSelector",
+			wantErrSub:  "VPANodeSelector",
+		},
+		{
+			name: "rejected when selector is empty {}",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector:  &vpa_types.VerticalPodAutoscalerSelector{},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+			wantErrPath: "spec.selector.nodeSelector",
+			wantErrSub:  "at least one selector field must be set",
+		},
+		{
+			name: "rejected when nodeSelector is empty {}",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+			wantErrPath: "spec.selector.nodeSelector",
+			wantErrSub:  "at least one matchLabels or matchExpressions",
+		},
+		{
+			name: "rejected when nodeSelector is malformed",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{Key: "pool", Operator: "InvalidOp", Values: []string{"gpu"}},
+							},
+						},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+			wantErrPath: "spec.selector.nodeSelector.matchExpressions[0].operator",
+		},
+		{
+			name: "rejected when targetRef.kind is Deployment instead of DaemonSet",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: deployRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true},
+			wantErrPath: "spec.selector.nodeSelector",
+			wantErrSub:  "DaemonSet",
+		},
+		{
+			name: "rejected when spec.startupBoost is combined with selector",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+					},
+					StartupBoost: &vpa_types.StartupBoost{
+						CPU: &vpa_types.GenericStartupBoost{
+							Type:   vpa_types.FactorStartupBoostType,
+							Factor: &validFactor,
+						},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true, AllowCPUStartupBoost: true},
+			wantErrPath: "spec.startupBoost",
+			wantErrSub:  "startupBoost cannot be set when selector is set",
+		},
+		{
+			name: "rejected when containerPolicies[].startupBoost is combined with selector",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					TargetRef: dsRef,
+					Selector: &vpa_types.VerticalPodAutoscalerSelector{
+						NodeSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+					},
+					ResourcePolicy: &vpa_types.PodResourcePolicy{
+						ContainerPolicies: []vpa_types.ContainerResourcePolicy{
+							{
+								ContainerName: "c1",
+								StartupBoost: &vpa_types.StartupBoost{
+									CPU: &vpa_types.GenericStartupBoost{
+										Type:   vpa_types.FactorStartupBoostType,
+										Factor: &validFactor,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			opts:        VPAValidationOptions{IsVPACreate: true, AllowVPANodeSelector: true, AllowCPUStartupBoost: true},
+			wantErrPath: "spec.resourcePolicy.containerPolicies[0].startupBoost",
+			wantErrSub:  "startupBoost cannot be set when selector is set",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs := validateVPA(&tc.vpa, tc.opts)
+			if tc.wantErrPath == "" {
+				assert.Empty(t, errs)
+				return
+			}
+			if assert.NotEmpty(t, errs) {
+				matched := false
+				for _, err := range errs {
+					if err.Field == tc.wantErrPath && (tc.wantErrSub == "" || assert.Contains(t, err.Error(), tc.wantErrSub)) {
+						matched = true
+					}
+				}
+				assert.True(t, matched, "expected error on field %q in %v", tc.wantErrPath, errs)
+			}
+		})
 	}
 }

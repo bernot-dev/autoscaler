@@ -28,9 +28,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	target_mock "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/mock"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
@@ -208,4 +211,106 @@ func TestGetMatchingVpa(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetMatchingVpaWithNodeSelector(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+
+	ds := appsv1.DaemonSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "DaemonSet",
+			APIVersion: "apps/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ds-agent",
+			Namespace: "default",
+		},
+	}
+	targetRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       ds.Kind,
+		Name:       ds.Name,
+		APIVersion: ds.APIVersion,
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	assert.NoError(t, nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-gpu", Labels: map[string]string{"pool": "gpu"}},
+	}))
+	assert.NoError(t, nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-maint", Labels: map[string]string{"pool": "maint"}},
+	}))
+	assert.NoError(t, nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cpu", Labels: map[string]string{"pool": "cpu"}},
+	}))
+	nodeLister := listersv1.NewNodeLister(nodeIndexer)
+
+	dsPodForNode := func(nodeName string) *corev1.Pod {
+		b := test.Pod().WithName("pod-" + nodeName).WithLabels(map[string]string{"app": "agent"}).
+			AddContainer(test.Container().WithName("c1").Get()).
+			WithCreator(&ds.ObjectMeta, &ds.TypeMeta)
+		if nodeName != "" {
+			b = b.WithAffinity(&corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchFields: []corev1.NodeSelectorRequirement{
+									{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{nodeName}},
+								},
+							},
+						},
+					},
+				},
+			})
+		}
+		return b.Get()
+	}
+
+	vpaDryRunOff := test.VerticalPodAutoscaler().WithContainer("c1").
+		WithName("vpa-dryrun-off").WithCreationTimestamp(time.Unix(1, 0)).
+		WithUpdateMode(vpa_types.UpdateModeOff).WithTargetRef(targetRef).Get()
+	vpaFallback := test.VerticalPodAutoscaler().WithContainer("c1").
+		WithName("vpa-fallback").WithCreationTimestamp(time.Unix(2, 0)).
+		WithUpdateMode(vpa_types.UpdateModeRecreate).WithTargetRef(targetRef).Get()
+	vpaGPU := test.VerticalPodAutoscaler().WithContainer("c1").
+		WithName("vpa-gpu").WithCreationTimestamp(time.Unix(10, 0)).
+		WithUpdateMode(vpa_types.UpdateModeRecreate).WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).Get()
+	vpaMaintOff := test.VerticalPodAutoscaler().WithContainer("c1").
+		WithName("vpa-maint-off").WithCreationTimestamp(time.Unix(20, 0)).
+		WithUpdateMode(vpa_types.UpdateModeOff).WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "maint"}}).Get()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).AnyTimes().Return(parseLabelSelector("app = agent"), nil)
+
+	vpaIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, vpa_api_util.VPAIndexers())
+	for _, vpa := range []*vpa_types.VerticalPodAutoscaler{vpaDryRunOff, vpaFallback, vpaGPU, vpaMaintOff} {
+		assert.NoError(t, vpaIndexer.Add(vpa))
+	}
+
+	matcher := NewMatcherWithNodeLister(vpaIndexer, mockSelectorFetcher, controllerfetcher.FakeControllerFetcher{}, nodeLister)
+
+	// GPU node matches vpa-gpu despite older fallback VPA.
+	gotGPU := matcher.GetMatchingVPA(context.Background(), dsPodForNode("node-gpu"))
+	if assert.NotNil(t, gotGPU) {
+		assert.Equal(t, "vpa-gpu", gotGPU.Name)
+	}
+
+	// Maintenance node matches Off selector VPA, which suppresses fallback VPA mutation.
+	assert.Nil(t, matcher.GetMatchingVPA(context.Background(), dsPodForNode("node-maint")))
+
+	// CPU node is uncovered by selector VPAs and falls back to vpa-fallback (ignoring older plain Off VPA).
+	gotCPU := matcher.GetMatchingVPA(context.Background(), dsPodForNode("node-cpu"))
+	if assert.NotNil(t, gotCPU) {
+		assert.Equal(t, "vpa-fallback", gotCPU.Name)
+	}
+
+	// Missing node in cache does NOT fall back to vpa-fallback when selector VPAs target the DaemonSet.
+	assert.Nil(t, matcher.GetMatchingVPA(context.Background(), dsPodForNode("node-missing")))
+
+	// Missing nodeAffinity on DaemonSet pod does NOT fall back to vpa-fallback.
+	assert.Nil(t, matcher.GetMatchingVPA(context.Background(), dsPodForNode("")))
 }

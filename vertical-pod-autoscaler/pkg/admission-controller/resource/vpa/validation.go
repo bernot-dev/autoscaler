@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apires "k8s.io/apimachinery/pkg/api/resource"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -33,6 +34,7 @@ type VPAValidationOptions struct {
 	AllowCPUStartupBoost bool
 	AllowPerVPAConfig    bool
 	AllowInPlace         bool
+	AllowVPANodeSelector bool
 	// ExistingControlledResources contains the controlled resources already
 	// present in the old VPA object, which stay allowed on update even if
 	// they wouldn't be accepted on create.
@@ -45,6 +47,7 @@ func getValidationOptionsForVPA(oldObj *vpa_types.VerticalPodAutoscaler) VPAVali
 		AllowCPUStartupBoost:        allowCPUBoost(oldObj),
 		AllowPerVPAConfig:           allowPerVPAConfig(oldObj),
 		AllowInPlace:                allowInPlace(oldObj),
+		AllowVPANodeSelector:        allowVPANodeSelector(oldObj),
 		ExistingControlledResources: existingControlledResources(oldObj),
 	}
 
@@ -130,6 +133,16 @@ func allowInPlace(oldObj *vpa_types.VerticalPodAutoscaler) bool {
 	return false
 }
 
+func allowVPANodeSelector(oldObj *vpa_types.VerticalPodAutoscaler) bool {
+	if features.Enabled(features.VPANodeSelector) {
+		return true
+	}
+	if oldObj == nil {
+		return false
+	}
+	return oldObj.Spec.Selector != nil && oldObj.Spec.Selector.NodeSelector != nil
+}
+
 func validateVPA(vpa *vpa_types.VerticalPodAutoscaler, opts VPAValidationOptions) ([]string, field.ErrorList) {
 	return validateVPASpec(&vpa.Spec, field.NewPath("spec"), opts)
 }
@@ -159,11 +172,53 @@ func validateVPASpec(spec *vpa_types.VerticalPodAutoscalerSpec, fldPath *field.P
 		allErrs = append(allErrs, validateVPASpecStartupBoost(spec.StartupBoost, fldPath.Child("startupBoost"), opts)...)
 	}
 
+	if spec.Selector != nil {
+		allErrs = append(allErrs, validateVPASpecSelector(spec, fldPath.Child("selector"), fldPath, opts)...)
+	}
+
 	if len(spec.Recommenders) > 1 {
 		allErrs = append(allErrs, field.TooMany(fldPath.Child("recommenders"), len(spec.Recommenders), 1))
 	}
 
 	return warnings, allErrs
+}
+
+func validateVPASpecSelector(spec *vpa_types.VerticalPodAutoscalerSpec, selectorPath, specPath *field.Path, opts VPAValidationOptions) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	if spec.Selector.NodeSelector == nil {
+		allErrs = append(allErrs, field.Required(selectorPath.Child("nodeSelector"), "at least one selector field must be set when selector is present"))
+	} else {
+		nodeSelectorPath := selectorPath.Child("nodeSelector")
+		ns := spec.Selector.NodeSelector
+		if !opts.AllowVPANodeSelector {
+			allErrs = append(allErrs, field.Forbidden(nodeSelectorPath, fmt.Sprintf("nodeSelector requires the %s feature gate to be enabled", features.VPANodeSelector)))
+		}
+		if len(ns.MatchLabels) == 0 && len(ns.MatchExpressions) == 0 {
+			allErrs = append(allErrs, field.Invalid(nodeSelectorPath, ns, "nodeSelector must specify at least one matchLabels or matchExpressions entry"))
+		}
+		allErrs = append(allErrs, metav1validation.ValidateLabelSelector(ns, metav1validation.LabelSelectorValidationOptions{}, nodeSelectorPath)...)
+		if spec.TargetRef == nil || spec.TargetRef.Kind != "DaemonSet" {
+			targetKind := ""
+			if spec.TargetRef != nil {
+				targetKind = spec.TargetRef.Kind
+			}
+			allErrs = append(allErrs, field.Invalid(nodeSelectorPath, targetKind, "nodeSelector is only allowed when targetRef.kind is DaemonSet"))
+		}
+	}
+
+	if spec.StartupBoost != nil {
+		allErrs = append(allErrs, field.Forbidden(specPath.Child("startupBoost"), "startupBoost cannot be set when selector is set"))
+	}
+	if spec.ResourcePolicy != nil {
+		for i, cp := range spec.ResourcePolicy.ContainerPolicies {
+			if cp.StartupBoost != nil {
+				allErrs = append(allErrs, field.Forbidden(specPath.Child("resourcePolicy", "containerPolicies").Index(i).Child("startupBoost"), "startupBoost cannot be set when selector is set"))
+			}
+		}
+	}
+
+	return allErrs
 }
 
 func validateVPASpecUpdatePolicy(updatePolicy *vpa_types.PodUpdatePolicy, fldPath *field.Path, opts VPAValidationOptions) ([]string, field.ErrorList) {

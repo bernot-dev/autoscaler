@@ -124,8 +124,65 @@ type AggregateContainerState struct {
 	MemoryAggregationIntervalDuration time.Duration
 	MemoryAggregationIntervalCount    int64
 	ControlledResources               *[]ResourceName
+	controllingVpa                    *Vpa
 
 	mutex sync.RWMutex
+}
+
+// isVpaStronger reports whether VPA a takes precedence over VPA b when both
+// match the same pod or aggregation, mirroring vpa_api_util.Stronger.
+func isVpaStronger(a, b *Vpa) bool {
+	if a == nil {
+		return false
+	}
+	if b == nil {
+		return true
+	}
+	if features.Enabled(features.VPANodeSelector) && a.HasSelector != b.HasSelector {
+		return a.HasSelector
+	}
+	if !a.Created.Equal(b.Created) {
+		return a.Created.Before(b.Created)
+	}
+	return a.ID.VpaName < b.ID.VpaName
+}
+
+// tryClaimControl records vpa as the controlling VPA of this aggregation if no
+// stronger VPA currently controls it, returning true if vpa now controls it.
+func (a *AggregateContainerState) tryClaimControl(vpa *Vpa) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if a.controllingVpa == nil || a.controllingVpa == vpa || isVpaStronger(vpa, a.controllingVpa) {
+		a.controllingVpa = vpa
+		return true
+	}
+	return false
+}
+
+// isControlledByOrUnclaimed returns true if vpa is the controlling VPA of this
+// aggregation or if no controlling VPA has claimed it.
+func (a *AggregateContainerState) isControlledByOrUnclaimed(vpa *Vpa) bool {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return a.controllingVpa == nil || a.controllingVpa == vpa
+}
+
+// releaseControl clears controllingVpa if it matches vpa, returning true if cleared
+// or already nil.
+func (a *AggregateContainerState) releaseControl(vpa *Vpa) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if a.controllingVpa == nil || a.controllingVpa == vpa {
+		a.controllingVpa = nil
+		return true
+	}
+	return false
+}
+
+func (a *AggregateContainerState) setControllingVpa(vpa *Vpa) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	a.controllingVpa = vpa
 }
 
 // GetLastRecommendation returns last recorded recommendation in a thread-safe manner.
@@ -329,6 +386,12 @@ func (a *AggregateContainerState) getMemoryAggregationWindowLength() time.Durati
 // UpdateFromPolicy updates container state scaling mode and controlled resources based on resource
 // policy of the VPA object.
 func (a *AggregateContainerState) UpdateFromPolicy(resourcePolicy *vpa_types.ContainerResourcePolicy) {
+	config := GetAggregationsConfig()
+	a.OOMBumpUpRatio = config.OOMBumpUpRatio
+	a.OOMMinBumpUp = config.OOMMinBumpUp
+	a.MemoryAggregationIntervalDuration = config.MemoryAggregationIntervalDuration
+	a.MemoryAggregationIntervalCount = config.MemoryAggregationIntervalCount
+
 	// ContainerScalingModeAuto is the default scaling mode
 	scalingModeAuto := vpa_types.ContainerScalingModeAuto
 	a.ScalingMode = &scalingModeAuto

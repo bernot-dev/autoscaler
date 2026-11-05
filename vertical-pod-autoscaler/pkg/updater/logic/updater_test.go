@@ -19,6 +19,7 @@ package logic
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,10 +40,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 	"k8s.io/utils/set"
 
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
@@ -1174,4 +1178,486 @@ func TestProcessNextBoostItem_RetryExhaustion_ThenResync(t *testing.T) {
 	assert.True(t, u.processNextBoostItem(ctx))
 	inplace.AssertNumberOfCalls(t, "InPlaceUpdate", 1)
 	assert.Equal(t, 0, queue.Len(), "queue should be empty after successful unboost")
+}
+
+func evictedPodNames(actions []clienttesting.Action) []string {
+	var names []string
+	for _, action := range actions {
+		if action.GetVerb() == "create" && action.GetSubresource() == "eviction" {
+			createAction, ok := action.(clienttesting.CreateAction)
+			if !ok {
+				continue
+			}
+			if eviction, ok := createAction.GetObject().(*policyv1.Eviction); ok {
+				names = append(names, eviction.Name)
+			}
+		}
+	}
+	return names
+}
+
+func TestRunOnce_NodeSelectorPartitioningAndFallback(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.InPlace, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	podLabels := map[string]string{"app": "agent"}
+	selector := parseLabelSelector("app = agent")
+	containerName := "agent"
+	ds := appsv1.DaemonSet{
+		TypeMeta:   metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-ds", Namespace: "default"},
+		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 3},
+	}
+	targetRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       ds.Kind,
+		Name:       ds.Name,
+		APIVersion: ds.APIVersion,
+	}
+
+	nodes := []*corev1.Node{
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-gpu", Labels: map[string]string{"pool": "gpu"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-mem", Labels: map[string]string{"pool": "highmem"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-cpu", Labels: map[string]string{"pool": "cpu"}}},
+	}
+
+	makePodOnNode := func(name, nodeName string) *corev1.Pod {
+		return test.Pod().WithName(name).
+			WithNodeName(nodeName).
+			AddContainer(test.Container().WithName(containerName).
+				WithCPURequest(resource.MustParse("500m")).
+				WithMemRequest(resource.MustParse("100M")).
+				WithCPULimit(resource.MustParse("500m")).
+				WithMemLimit(resource.MustParse("100M")).Get()).
+			WithLabels(podLabels).
+			WithCreator(&ds.ObjectMeta, &ds.TypeMeta).
+			Get()
+	}
+
+	now := time.Now()
+	vpaGPU := test.VerticalPodAutoscaler().
+		WithName("vpa-gpu").
+		WithNamespace("default").
+		WithCreationTimestamp(now).
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlace).
+		WithMinReplicas(ptr.To(int32(1))).
+		WithTarget("4", "400M").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).
+		Get()
+	vpaMem := test.VerticalPodAutoscaler().
+		WithName("vpa-mem").
+		WithNamespace("default").
+		WithCreationTimestamp(now).
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlace).
+		WithMinReplicas(ptr.To(int32(1))).
+		WithTarget("2", "800M").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "highmem"}}).
+		Get()
+	vpaFallback := test.VerticalPodAutoscaler().
+		WithName("vpa-fallback").
+		WithNamespace("default").
+		WithCreationTimestamp(now.Add(-time.Hour)). // older than selector VPAs, yet selector VPAs still win!
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlace).
+		WithMinReplicas(ptr.To(int32(1))).
+		WithTarget("1", "200M").
+		WithTargetRef(targetRef).
+		Get()
+
+	t.Run("pods match their node selector VPA and uncovered node falls back to plain VPA", func(t *testing.T) {
+		podGPU := makePodOnNode("pod-gpu", "node-gpu")
+		podMem := makePodOnNode("pod-mem", "node-mem")
+		podCPU := makePodOnNode("pod-cpu", "node-cpu")
+		kubeClient := fake.NewSimpleClientset(podGPU, podMem, podCPU)
+		informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+		require.NoError(t, informerFactory.Apps().V1().DaemonSets().Informer().GetStore().Add(&ds))
+		nodeStore := informerFactory.Core().V1().Nodes().Informer().GetStore()
+		for _, n := range nodes {
+			require.NoError(t, nodeStore.Add(n))
+		}
+
+		limitRangeCalc := limitrange.NewNoopLimitsCalculator()
+		recProvider := recommendation.NewProvider(limitRangeCalc, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalc))
+		calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recProvider)}
+		restrictionFactory := restriction.NewPodsRestrictionFactory(kubeClient, informerFactory, 2, 0.5, calculators, false)
+
+		podLister := &test.PodListerMock{}
+		podLister.On("List").Return([]*corev1.Pod{podGPU, podMem, podCPU}, nil)
+
+		mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+		mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaGPU)).Return(selector, nil)
+		mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaMem)).Return(selector, nil)
+		mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaFallback)).Return(selector, nil)
+
+		u := &updater{
+			vpaIndexer:                   newVPAIndexer(t, vpaGPU, vpaMem, vpaFallback),
+			podLister:                    podLister,
+			nodeLister:                   informerFactory.Core().V1().Nodes().Lister(),
+			restrictionFactory:           restrictionFactory,
+			evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+			inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+			evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+			recommendationProcessor:      &test.FakeRecommendationProcessor{},
+			selectorFetcher:              mockSelectorFetcher,
+			controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+			useAdmissionControllerStatus: true,
+			statusValidator:              newFakeValidator(true),
+			priorityProcessor:            priority.NewProcessor(),
+			eventRecorder:                record.NewFakeRecorder(10),
+		}
+
+		u.RunOnce(context.Background())
+
+		gotGPU, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "pod-gpu", metav1.GetOptions{})
+		require.NoError(t, err)
+		test.AssertResourceListEqual(t, "pod-gpu requests", vpaGPU.Status.Recommendation.ContainerRecommendations[0].Target, gotGPU.Spec.Containers[0].Resources.Requests)
+
+		gotMem, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "pod-mem", metav1.GetOptions{})
+		require.NoError(t, err)
+		test.AssertResourceListEqual(t, "pod-mem requests", vpaMem.Status.Recommendation.ContainerRecommendations[0].Target, gotMem.Spec.Containers[0].Resources.Requests)
+
+		gotCPU, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "pod-cpu", metav1.GetOptions{})
+		require.NoError(t, err)
+		test.AssertResourceListEqual(t, "pod-cpu requests", vpaFallback.Status.Recommendation.ContainerRecommendations[0].Target, gotCPU.Spec.Containers[0].Resources.Requests)
+	})
+
+	t.Run("pod on uncovered node is skipped when no fallback VPA exists", func(t *testing.T) {
+		podGPU := makePodOnNode("pod-gpu", "node-gpu")
+		podCPU := makePodOnNode("pod-cpu", "node-cpu")
+		origCPUReqs := podCPU.Spec.Containers[0].Resources.Requests.DeepCopy()
+
+		kubeClient := fake.NewSimpleClientset(podGPU, podCPU)
+		informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+		require.NoError(t, informerFactory.Apps().V1().DaemonSets().Informer().GetStore().Add(&ds))
+		nodeStore := informerFactory.Core().V1().Nodes().Informer().GetStore()
+		for _, n := range nodes {
+			require.NoError(t, nodeStore.Add(n))
+		}
+
+		limitRangeCalc := limitrange.NewNoopLimitsCalculator()
+		recProvider := recommendation.NewProvider(limitRangeCalc, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalc))
+		calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recProvider)}
+		restrictionFactory := restriction.NewPodsRestrictionFactory(kubeClient, informerFactory, 2, 0.5, calculators, false)
+
+		podLister := &test.PodListerMock{}
+		podLister.On("List").Return([]*corev1.Pod{podGPU, podCPU}, nil)
+
+		mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+		mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaGPU)).Return(selector, nil)
+
+		u := &updater{
+			vpaIndexer:                   newVPAIndexer(t, vpaGPU),
+			podLister:                    podLister,
+			nodeLister:                   informerFactory.Core().V1().Nodes().Lister(),
+			restrictionFactory:           restrictionFactory,
+			evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+			inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+			evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+			recommendationProcessor:      &test.FakeRecommendationProcessor{},
+			selectorFetcher:              mockSelectorFetcher,
+			controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+			useAdmissionControllerStatus: true,
+			statusValidator:              newFakeValidator(true),
+			priorityProcessor:            priority.NewProcessor(),
+			eventRecorder:                record.NewFakeRecorder(10),
+		}
+
+		u.RunOnce(context.Background())
+
+		gotGPU, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "pod-gpu", metav1.GetOptions{})
+		require.NoError(t, err)
+		test.AssertResourceListEqual(t, "pod-gpu requests", vpaGPU.Status.Recommendation.ContainerRecommendations[0].Target, gotGPU.Spec.Containers[0].Resources.Requests)
+
+		gotCPU, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "pod-cpu", metav1.GetOptions{})
+		require.NoError(t, err)
+		test.AssertResourceListEqual(t, "pod-cpu unchanged requests", origCPUReqs, gotCPU.Spec.Containers[0].Resources.Requests)
+	})
+}
+
+func TestRunOnce_NodeSelectorDisruptionBudgetOffInitialAndTerminatingPods(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	podLabels := map[string]string{"app": "agent"}
+	selector := parseLabelSelector("app = agent")
+	containerName := "agent"
+	// 10-node DaemonSet: DesiredNumberScheduled=10 would block any <=5 pod partition without scoped configured!
+	ds := appsv1.DaemonSet{
+		TypeMeta:   metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-ds", Namespace: "default"},
+		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 10},
+	}
+	targetRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       ds.Kind,
+		Name:       ds.Name,
+		APIVersion: ds.APIVersion,
+	}
+
+	// Nodes:
+	// - gpu: 3 nodes (controlled by vpa-gpu, Recreate)
+	// - off: 2 nodes (controlled by vpa-off, Off -> must NOT be evicted by vpa-fallback)
+	// - initial: 1 node (controlled by vpa-initial, Initial -> must NOT be evicted by vpa-fallback)
+	// - cpu: 4 nodes (controlled by vpa-fallback, Recreate)
+	var nodes []*corev1.Node
+	var pods []*corev1.Pod
+	addNodeAndPod := func(podName, nodeName, pool string) *corev1.Pod {
+		nodes = append(nodes, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{"pool": pool}},
+		})
+		p := test.Pod().WithName(podName).
+			WithUID(types.UID(podName)).
+			WithNodeName(nodeName).
+			AddContainer(test.Container().WithName(containerName).
+				WithCPURequest(resource.MustParse("100m")).
+				WithMemRequest(resource.MustParse("100M")).Get()).
+			WithLabels(podLabels).
+			WithCreator(&ds.ObjectMeta, &ds.TypeMeta).
+			Get()
+		pods = append(pods, p)
+		return p
+	}
+
+	gpuPod1 := addNodeAndPod("pod-gpu-1", "node-gpu-1", "gpu")
+	gpuPod2 := addNodeAndPod("pod-gpu-2", "node-gpu-2", "gpu")
+	gpuPod3 := addNodeAndPod("pod-gpu-3", "node-gpu-3", "gpu")
+	addNodeAndPod("pod-off-1", "node-off-1", "off")
+	addNodeAndPod("pod-off-2", "node-off-2", "off")
+	addNodeAndPod("pod-init-1", "node-init-1", "initial")
+	addNodeAndPod("pod-cpu-1", "node-cpu-1", "cpu")
+	addNodeAndPod("pod-cpu-2", "node-cpu-2", "cpu")
+	addNodeAndPod("pod-cpu-3", "node-cpu-3", "cpu")
+	addNodeAndPod("pod-cpu-4", "node-cpu-4", "cpu")
+
+	now := time.Now()
+	vpaFallback := test.VerticalPodAutoscaler().
+		WithName("vpa-fallback").
+		WithNamespace("default").
+		WithCreationTimestamp(now.Add(-2 * time.Hour)). // oldest VPA
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeRecreate).
+		WithTarget("2", "500M").
+		WithTargetRef(targetRef).
+		Get()
+	vpaGPU := test.VerticalPodAutoscaler().
+		WithName("vpa-gpu").
+		WithNamespace("default").
+		WithCreationTimestamp(now).
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeRecreate).
+		WithTarget("4", "1G").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).
+		Get()
+	vpaOff := test.VerticalPodAutoscaler().
+		WithName("vpa-off").
+		WithNamespace("default").
+		WithCreationTimestamp(now.Add(time.Hour)). // newer than fallback, still wins because HasSelector!
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeOff).
+		WithTarget("8", "2G").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "off"}}).
+		Get()
+	vpaInitial := test.VerticalPodAutoscaler().
+		WithName("vpa-initial").
+		WithNamespace("default").
+		WithCreationTimestamp(now.Add(time.Hour)).
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInitial).
+		WithTarget("6", "1500M").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "initial"}}).
+		Get()
+
+	var runtimeObjs []runtime.Object
+	for _, p := range pods {
+		runtimeObjs = append(runtimeObjs, p)
+	}
+	kubeClient := fake.NewSimpleClientset(runtimeObjs...)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	require.NoError(t, informerFactory.Apps().V1().DaemonSets().Informer().GetStore().Add(&ds))
+	nodeStore := informerFactory.Core().V1().Nodes().Informer().GetStore()
+	for _, n := range nodes {
+		require.NoError(t, nodeStore.Add(n))
+	}
+
+	restrictionFactory := restriction.NewPodsRestrictionFactory(kubeClient, informerFactory, 2, 0.5, nil, false)
+	podLister := &test.PodListerMock{}
+	mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+
+	u := &updater{
+		vpaIndexer:                   newVPAIndexer(t, vpaFallback, vpaGPU, vpaOff, vpaInitial),
+		podLister:                    podLister,
+		nodeLister:                   informerFactory.Core().V1().Nodes().Lister(),
+		restrictionFactory:           restrictionFactory,
+		evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+		inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+		evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+		recommendationProcessor:      &test.FakeRecommendationProcessor{},
+		selectorFetcher:              mockSelectorFetcher,
+		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+		useAdmissionControllerStatus: true,
+		statusValidator:              newFakeValidator(true),
+		priorityProcessor:            priority.NewProcessor(),
+		eventRecorder:                record.NewFakeRecorder(20),
+	}
+
+	// Cycle 1: all 10 pods live.
+	// - vpa-gpu (3 pods, tolerance=0.5 -> budget 1): evicts 1 gpu pod.
+	// - vpa-fallback (4 cpu pods, tolerance=0.5 -> budget 2): evicts 2 cpu pods.
+	// - vpa-off and vpa-initial pods: 0 evictions.
+	podLister.On("List").Return(pods, nil).Once()
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).Return(selector, nil).Times(4)
+
+	u.RunOnce(context.Background())
+
+	evictedCycle1 := evictedPodNames(kubeClient.Actions())
+	assert.Len(t, evictedCycle1, 3, "expected 1 gpu pod + 2 cpu pods evicted, got %v", evictedCycle1)
+	gpuEvictedCount := 0
+	cpuEvictedCount := 0
+	for _, name := range evictedCycle1 {
+		assert.NotContains(t, []string{"pod-off-1", "pod-off-2", "pod-init-1"}, name, "Off and Initial selector VPA pods must never be evicted by fallback VPA")
+		switch name {
+		case "pod-gpu-1", "pod-gpu-2", "pod-gpu-3":
+			gpuEvictedCount++
+		case "pod-cpu-1", "pod-cpu-2", "pod-cpu-3", "pod-cpu-4":
+			cpuEvictedCount++
+		}
+	}
+	assert.Equal(t, 1, gpuEvictedCount, "vpa-gpu should evict exactly 1 of its 3 pods")
+	assert.Equal(t, 2, cpuEvictedCount, "vpa-fallback should evict exactly 2 of its 4 pods")
+
+	// Cycle 2: mark the evicted gpu pod as terminating (DeletionTimestamp != nil), while the other 2 gpu pods remain live.
+	// Because terminating pods are counted in configured (configured=3, live=2, tolerance=1 -> shouldBeAlive=2),
+	// vpa-gpu MUST NOT evict a second gpu pod while the first is still terminating!
+	kubeClient.ClearActions()
+	nowMeta := metav1.NewTime(now)
+	for _, p := range []*corev1.Pod{gpuPod1, gpuPod2, gpuPod3} {
+		if slices.Contains(evictedCycle1, p.Name) {
+			p.DeletionTimestamp = &nowMeta
+		}
+	}
+	// Also mark the 2 evicted cpu pods as terminating so vpa-fallback also has configured=4, live=2 -> 0 more evictions.
+	for _, p := range pods {
+		if slices.Contains(evictedCycle1, p.Name) {
+			p.DeletionTimestamp = &nowMeta
+		}
+	}
+
+	podLister.On("List").Return(pods, nil).Once()
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).Return(selector, nil).Times(4)
+
+	u.RunOnce(context.Background())
+	evictedCycle2 := evictedPodNames(kubeClient.Actions())
+	assert.Empty(t, evictedCycle2, "no additional pods should be evicted while evicted pods are terminating")
+}
+
+func TestRunOnce_NodeMissingFromCacheSkippedUntilPresent(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.InPlace, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	podLabels := map[string]string{"app": "agent"}
+	selector := parseLabelSelector("app = agent")
+	containerName := "agent"
+	ds := appsv1.DaemonSet{
+		TypeMeta:   metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-ds", Namespace: "default"},
+		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 1},
+	}
+	targetRef := &autoscalingv1.CrossVersionObjectReference{
+		Kind:       ds.Kind,
+		Name:       ds.Name,
+		APIVersion: ds.APIVersion,
+	}
+
+	pod := test.Pod().WithName("pod-missing-node").
+		WithNodeName("node-delayed").
+		AddContainer(test.Container().WithName(containerName).
+			WithCPURequest(resource.MustParse("500m")).
+			WithMemRequest(resource.MustParse("100M")).
+			WithCPULimit(resource.MustParse("500m")).
+			WithMemLimit(resource.MustParse("100M")).Get()).
+		WithLabels(podLabels).
+		WithCreator(&ds.ObjectMeta, &ds.TypeMeta).
+		Get()
+	origRequests := pod.Spec.Containers[0].Resources.Requests.DeepCopy()
+
+	vpaGPU := test.VerticalPodAutoscaler().
+		WithName("vpa-gpu").
+		WithNamespace("default").
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlace).
+		WithMinReplicas(ptr.To(int32(1))).
+		WithTarget("4", "400M").
+		WithTargetRef(targetRef).
+		WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).
+		Get()
+	vpaFallback := test.VerticalPodAutoscaler().
+		WithName("vpa-fallback").
+		WithNamespace("default").
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlace).
+		WithMinReplicas(ptr.To(int32(1))).
+		WithTarget("1", "200M").
+		WithTargetRef(targetRef).
+		Get()
+
+	kubeClient := fake.NewSimpleClientset(pod)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	require.NoError(t, informerFactory.Apps().V1().DaemonSets().Informer().GetStore().Add(&ds))
+	nodeStore := informerFactory.Core().V1().Nodes().Informer().GetStore()
+
+	limitRangeCalc := limitrange.NewNoopLimitsCalculator()
+	recProvider := recommendation.NewProvider(limitRangeCalc, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalc))
+	calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recProvider)}
+	restrictionFactory := restriction.NewPodsRestrictionFactory(kubeClient, informerFactory, 1, 0.5, calculators, false)
+
+	podLister := &test.PodListerMock{}
+	mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+
+	u := &updater{
+		vpaIndexer:                   newVPAIndexer(t, vpaGPU, vpaFallback),
+		podLister:                    podLister,
+		nodeLister:                   informerFactory.Core().V1().Nodes().Lister(),
+		restrictionFactory:           restrictionFactory,
+		evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+		inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+		evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+		recommendationProcessor:      &test.FakeRecommendationProcessor{},
+		selectorFetcher:              mockSelectorFetcher,
+		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+		useAdmissionControllerStatus: true,
+		statusValidator:              newFakeValidator(true),
+		priorityProcessor:            priority.NewProcessor(),
+		eventRecorder:                record.NewFakeRecorder(10),
+	}
+
+	// Cycle 1: node-delayed is missing from nodeStore -> pod is skipped (NOT given fallback VPA!).
+	podLister.On("List").Return([]*corev1.Pod{pod}, nil).Once()
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).Return(selector, nil).Times(2)
+	u.RunOnce(context.Background())
+
+	gotBefore, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	test.AssertResourceListEqual(t, "requests unchanged while node missing from cache", origRequests, gotBefore.Spec.Containers[0].Resources.Requests)
+
+	// Cycle 2: node-delayed appears in nodeStore with pool=gpu -> pod is updated with vpa-gpu!
+	require.NoError(t, nodeStore.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-delayed", Labels: map[string]string{"pool": "gpu"}},
+	}))
+	podLister.On("List").Return([]*corev1.Pod{pod}, nil).Once()
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).Return(selector, nil).Times(2)
+	u.RunOnce(context.Background())
+
+	gotAfter, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	test.AssertResourceListEqual(t, "requests updated once node appears in cache", vpaGPU.Status.Recommendation.ContainerRecommendations[0].Target, gotAfter.Spec.Containers[0].Resources.Requests)
 }
