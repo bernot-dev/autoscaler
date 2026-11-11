@@ -35,6 +35,7 @@ import (
 	resource_admission "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
@@ -985,4 +986,87 @@ func TestGetResizeStatus(t *testing.T) {
 			assert.Equal(t, tc.expectedStatus, result)
 		})
 	}
+}
+
+func TestGetCreatorMapsWithConfiguredOverrides(t *testing.T) {
+	ds := appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ds",
+			Namespace: "default",
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "DaemonSet",
+		},
+		Status: appsv1.DaemonSetStatus{
+			DesiredNumberScheduled: 10,
+		},
+	}
+	dsKey := controllerfetcher.ControllerKey{
+		Namespace: "default",
+		Kind:      "DaemonSet",
+		Name:      "ds",
+	}
+
+	makePods := func(n int) []*corev1.Pod {
+		pods := make([]*corev1.Pod, n)
+		for i := range n {
+			pods[i] = test.Pod().WithName(getTestPodName(i)).WithCreator(&ds.ObjectMeta, &ds.TypeMeta).Get()
+		}
+		return pods
+	}
+
+	t.Run("minority partition of 2 pods on 10-node DaemonSet can evict 1 pod with override", func(t *testing.T) {
+		pods := makePods(2)
+		vpa := getBasicVpa()
+		factory, err := getRestrictionFactory(nil, nil, nil, &ds, 2, 0.5, nil, nil, nil, false)
+		assert.NoError(t, err)
+
+		// Without override: configured=10, tolerance=5, running=2 <= shouldBeAlive(5) -> blocked.
+		statsNoOverride, podMapNoOverride, err := factory.GetCreatorMaps(pods, vpa)
+		assert.NoError(t, err)
+		evictionNoOverride := factory.NewPodsEvictionRestriction(statsNoOverride, podMapNoOverride)
+		assert.False(t, evictionNoOverride.CanEvict(pods[0]))
+
+		// With scoped override=2: configured=2, tolerance=1, running=2 > shouldBeAlive(1) -> 1 pod evictable.
+		statsOverride, podMapOverride, err := factory.GetCreatorMapsWithConfiguredOverrides(pods, vpa, map[controllerfetcher.ControllerKey]int{dsKey: 2})
+		assert.NoError(t, err)
+		evictionOverride := factory.NewPodsEvictionRestriction(statsOverride, podMapOverride)
+		assert.True(t, evictionOverride.CanEvict(pods[0]))
+		assert.NoError(t, evictionOverride.Evict(pods[0], vpa, test.FakeEventRecorder()))
+		assert.False(t, evictionOverride.CanEvict(pods[1]))
+	})
+
+	t.Run("terminating pod included in configured override prevents cascading eviction", func(t *testing.T) {
+		// 3-node partition where 1 pod is already terminating and 2 live pods remain.
+		livePods := makePods(2)
+		vpa := getBasicVpa()
+		factory, err := getRestrictionFactory(nil, nil, nil, &ds, 2, 0.5, nil, nil, nil, false)
+		assert.NoError(t, err)
+
+		stats, podMap, err := factory.GetCreatorMapsWithConfiguredOverrides(livePods, vpa, map[controllerfetcher.ControllerKey]int{dsKey: 3})
+		assert.NoError(t, err)
+		eviction := factory.NewPodsEvictionRestriction(stats, podMap)
+		assert.False(t, eviction.CanEvict(livePods[0]))
+		assert.False(t, eviction.CanEvict(livePods[1]))
+	})
+
+	t.Run("single-node partition requires minReplicas=1 for eviction", func(t *testing.T) {
+		livePods := makePods(1)
+		factory, err := getRestrictionFactory(nil, nil, nil, &ds, 2, 0.5, nil, nil, nil, false)
+		assert.NoError(t, err)
+
+		// Default minReplicas=2 blocks single-pod partition.
+		statsDefault, podMapDefault, err := factory.GetCreatorMapsWithConfiguredOverrides(livePods, getBasicVpa(), map[controllerfetcher.ControllerKey]int{dsKey: 1})
+		assert.NoError(t, err)
+		evictionDefault := factory.NewPodsEvictionRestriction(statsDefault, podMapDefault)
+		assert.False(t, evictionDefault.CanEvict(livePods[0]))
+
+		// Per-VPA minReplicas=1 allows evicting single-pod partition.
+		vpaMin1 := getBasicVpa()
+		vpaMin1.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{MinReplicas: ptr.To(int32(1))}
+		statsMin1, podMapMin1, err := factory.GetCreatorMapsWithConfiguredOverrides(livePods, vpaMin1, map[controllerfetcher.ControllerKey]int{dsKey: 1})
+		assert.NoError(t, err)
+		evictionMin1 := factory.NewPodsEvictionRestriction(statsMin1, podMapMin1)
+		assert.True(t, evictionMin1.CanEvict(livePods[0]))
+	})
 }

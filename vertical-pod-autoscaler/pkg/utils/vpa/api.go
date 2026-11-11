@@ -37,6 +37,7 @@ import (
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
 	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1"
 	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/client"
@@ -186,11 +187,86 @@ func PodLabelsMatchVPA(podNamespace string, labels labels.Set, vpaNamespace stri
 	return vpaSelector.Matches(labels)
 }
 
+// HasSelector returns true if the VPA has a non-empty selector configured.
+func HasSelector(vpa *vpa_types.VerticalPodAutoscaler) bool {
+	return vpa != nil && vpa.Spec.Selector != nil && vpa.Spec.Selector.NodeSelector != nil
+}
+
+// NodeLabelsMatchVPA returns true if VPANodeSelector is disabled, the VPA has
+// no nodeSelector, or the node's labels match the VPA's nodeSelector.
+func NodeLabelsMatchVPA(nodeLabels labels.Set, vpa *vpa_types.VerticalPodAutoscaler) bool {
+	if !features.Enabled(features.VPANodeSelector) || !HasSelector(vpa) {
+		return true
+	}
+	selector, err := metav1.LabelSelectorAsSelector(vpa.Spec.Selector.NodeSelector)
+	if err != nil {
+		klog.ErrorS(err, "Invalid nodeSelector on VPA", "vpa", klog.KObj(vpa))
+		return false
+	}
+	return selector.Matches(nodeLabels)
+}
+
+// NodeNameForPod resolves the target node name for a Pod. It returns pod.Spec.NodeName
+// when set; otherwise, for DaemonSet pods at admission time, it extracts the target node
+// name from requiredDuringSchedulingIgnoredDuringExecution nodeSelectorTerms[].matchFields
+// where key == "metadata.name" and operator == In with a single non-empty value.
+func NodeNameForPod(pod *corev1.Pod, controllerKind string) (string, bool) {
+	if pod == nil {
+		return "", false
+	}
+	if pod.Spec.NodeName != "" {
+		return pod.Spec.NodeName, true
+	}
+	if controllerKind != "DaemonSet" {
+		return "", false
+	}
+	if pod.Spec.Affinity == nil ||
+		pod.Spec.Affinity.NodeAffinity == nil ||
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return "", false
+	}
+	terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) == 0 {
+		return "", false
+	}
+	resolvedNode := ""
+	for _, term := range terms {
+		termNode := ""
+		for _, req := range term.MatchFields {
+			if req.Key != metav1.ObjectNameField {
+				continue
+			}
+			if req.Operator != corev1.NodeSelectorOpIn || len(req.Values) != 1 || req.Values[0] == "" {
+				return "", false
+			}
+			if termNode != "" && termNode != req.Values[0] {
+				return "", false
+			}
+			termNode = req.Values[0]
+		}
+		if termNode == "" {
+			return "", false
+		}
+		if resolvedNode != "" && resolvedNode != termNode {
+			return "", false
+		}
+		resolvedNode = termNode
+	}
+	return resolvedNode, resolvedNode != ""
+}
+
 // Stronger returns true iff a is before b in the order to control a Pod (that matches both VPAs).
 func Stronger(a, b *vpa_types.VerticalPodAutoscaler) bool {
 	// Assume a is not nil and each valid object is before nil object.
 	if b == nil {
 		return true
+	}
+	if features.Enabled(features.VPANodeSelector) {
+		aHasSelector := HasSelector(a)
+		bHasSelector := HasSelector(b)
+		if aHasSelector != bHasSelector {
+			return aHasSelector
+		}
 	}
 	// Compare creation timestamps of the VPA objects. This is the clue of the stronger logic.
 	var aTime, bTime metav1.Time

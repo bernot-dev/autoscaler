@@ -334,6 +334,7 @@ type mockAggregateStateKey struct {
 	namespace     string
 	containerName string
 	labels        string
+	nodeName      string
 }
 
 func (k mockAggregateStateKey) Namespace() string {
@@ -348,6 +349,10 @@ func (k mockAggregateStateKey) Labels() labels.Labels {
 	// Should return empty on error
 	labels, _ := labels.ConvertSelectorToLabelsMap(k.labels)
 	return labels
+}
+
+func (k mockAggregateStateKey) NodeName() string {
+	return k.nodeName
 }
 
 type fakeClusterStateFeeder struct {

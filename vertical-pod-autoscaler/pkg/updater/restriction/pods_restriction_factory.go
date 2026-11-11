@@ -32,6 +32,7 @@ import (
 
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -56,6 +57,7 @@ type podReplicaCreator struct {
 // PodsRestrictionFactory is a factory for creating PodsEvictionRestriction and PodsInPlaceRestriction.
 type PodsRestrictionFactory interface {
 	GetCreatorMaps(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) (map[podReplicaCreator]singleGroupStats, map[string]podReplicaCreator, error)
+	GetCreatorMapsWithConfiguredOverrides(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler, configuredOverrides map[controllerfetcher.ControllerKey]int) (map[podReplicaCreator]singleGroupStats, map[string]podReplicaCreator, error)
 	NewPodsEvictionRestriction(creatorToSingleGroupStatsMap map[podReplicaCreator]singleGroupStats, podToReplicaCreatorMap map[string]podReplicaCreator) PodsEvictionRestriction
 	NewPodsInPlaceRestriction(creatorToSingleGroupStatsMap map[podReplicaCreator]singleGroupStats, podToReplicaCreatorMap map[string]podReplicaCreator) PodsInPlaceRestriction
 }
@@ -159,6 +161,12 @@ func (f *PodsRestrictionFactoryImpl) getReplicaCount(creator podReplicaCreator) 
 // GetCreatorMaps is a helper function that returns a map of pod replica creators to their single group stats
 // and a map of pod ids to pod replica creator from a list of pods and it's corresponding VPA.
 func (f *PodsRestrictionFactoryImpl) GetCreatorMaps(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) (map[podReplicaCreator]singleGroupStats, map[string]podReplicaCreator, error) {
+	return f.GetCreatorMapsWithConfiguredOverrides(pods, vpa, nil)
+}
+
+// GetCreatorMapsWithConfiguredOverrides behaves like GetCreatorMaps, additionally allowing the caller
+// to override the configured pod count per controller (used when selector VPAs partition a DaemonSet).
+func (f *PodsRestrictionFactoryImpl) GetCreatorMapsWithConfiguredOverrides(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler, configuredOverrides map[controllerfetcher.ControllerKey]int) (map[podReplicaCreator]singleGroupStats, map[string]podReplicaCreator, error) {
 	livePods := make(map[podReplicaCreator][]*corev1.Pod)
 
 	for _, pod := range pods {
@@ -209,7 +217,14 @@ func (f *PodsRestrictionFactoryImpl) GetCreatorMaps(pods []*corev1.Pod, vpa *vpa
 		}
 
 		var configured int
-		if creator.Kind == job {
+		creatorKey := controllerfetcher.ControllerKey{
+			Namespace: creator.Namespace,
+			Kind:      string(creator.Kind),
+			Name:      creator.Name,
+		}
+		if override, ok := configuredOverrides[creatorKey]; ok && override > 0 {
+			configured = override
+		} else if creator.Kind == job {
 			// Job has no replicas configuration, so we will use actual number of live pods as replicas count.
 			configured = actual
 		} else {

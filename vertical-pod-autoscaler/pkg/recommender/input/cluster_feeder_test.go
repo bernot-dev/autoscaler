@@ -31,12 +31,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	fakeautoscalingv1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1/fake"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/metrics"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
@@ -108,7 +112,11 @@ func (cs *fakeClusterState) AddSample(sample *model.ContainerUsageSampleWithKey)
 	return nil
 }
 
-func (cs *fakeClusterState) AddOrUpdatePod(podID model.PodID, _ labels.Set, _ corev1.PodPhase) {
+func (cs *fakeClusterState) AddOrUpdatePod(podID model.PodID, l labels.Set, p corev1.PodPhase) {
+	cs.AddOrUpdatePodWithNode(podID, l, p, "")
+}
+
+func (cs *fakeClusterState) AddOrUpdatePodWithNode(podID model.PodID, _ labels.Set, _ corev1.PodPhase, nodeName string) {
 	cs.addedPods = append(cs.addedPods, podID)
 	if cs.stubbedPods == nil {
 		cs.stubbedPods = make(map[model.PodID]*model.PodState)
@@ -116,10 +124,15 @@ func (cs *fakeClusterState) AddOrUpdatePod(podID model.PodID, _ labels.Set, _ co
 	if cs.stubbedPods[podID] == nil {
 		cs.stubbedPods[podID] = &model.PodState{
 			ID:         podID,
+			NodeName:   nodeName,
 			Containers: make(map[string]*model.ContainerState),
 		}
+	} else {
+		cs.stubbedPods[podID].NodeName = nodeName
 	}
 }
+
+func (cs *fakeClusterState) SetNodes(_ map[string]labels.Set) {}
 
 func (cs *fakeClusterState) SetInitContainers(podID model.PodID, initContainers []string) error {
 	pod, podExists := cs.stubbedPods[podID]
@@ -1241,5 +1254,62 @@ func TestInitFromCheckpoints(t *testing.T) {
 			}
 			assert.Len(t, errorLogs, tc.expectedErrors, "unexpected error log entries:\n%s", strings.Join(errorLogs, "\n"))
 		})
+	}
+}
+
+func TestLoadNodesAndMemorySaverWithNodeSelector(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.VPANodeSelector, true)
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	assert.NoError(t, nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-gpu", Labels: map[string]string{"pool": "gpu"}},
+	}))
+	assert.NoError(t, nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cpu", Labels: map[string]string{"pool": "cpu"}},
+	}))
+	nodeLister := listersv1.NewNodeLister(nodeIndexer)
+
+	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	podGPU := test.Pod().WithName("pod-gpu").WithLabels(map[string]string{"app": "agent"}).WithNodeName("node-gpu").
+		AddContainer(test.Container().WithName("c1").Get()).Get()
+	podGPU.Namespace = "default"
+	podCPU := test.Pod().WithName("pod-cpu").WithLabels(map[string]string{"app": "agent"}).WithNodeName("node-cpu").
+		AddContainer(test.Container().WithName("c1").Get()).Get()
+	podCPU.Namespace = "default"
+	assert.NoError(t, podIndexer.Add(podGPU))
+	assert.NoError(t, podIndexer.Add(podCPU))
+
+	dsRef := &autoscalingv1.CrossVersionObjectReference{Kind: "DaemonSet", Name: "ds-agent", APIVersion: "apps/v1"}
+	vpaGPU := test.VerticalPodAutoscaler().WithName("vpa-gpu").WithNamespace("default").WithContainer("c1").
+		WithTargetRef(dsRef).WithNodeSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}).Get()
+
+	vpaLister := &test.VerticalPodAutoscalerListerMock{}
+	vpaLister.On("List").Return([]*vpa_types.VerticalPodAutoscaler{vpaGPU}, nil)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	selectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+	selectorFetcher.EXPECT().Fetch(gomock.Any()).Return(parseLabelSelector("app = agent"), nil).AnyTimes()
+
+	clusterState := model.NewClusterState(testGcPeriod)
+	feeder := clusterStateFeeder{
+		specClient:        spec.NewSpecClient(listersv1.NewPodLister(podIndexer)),
+		nodeLister:        nodeLister,
+		vpaLister:         vpaLister,
+		clusterState:      clusterState,
+		selectorFetcher:   selectorFetcher,
+		memorySaveMode:    true,
+		controllerFetcher: &controllerfetcher.FakeControllerFetcher{},
+		recommenderName:   DefaultRecommenderName,
+	}
+
+	feeder.LoadNodes()
+	feeder.LoadVPAs(t.Context())
+	feeder.LoadPods()
+
+	// In memorySaveMode, only pod-gpu on node-gpu matches vpa-gpu's nodeSelector.
+	assert.Len(t, clusterState.Pods(), 1)
+	if podState, ok := clusterState.Pods()[model.PodID{Namespace: "default", PodName: "pod-gpu"}]; assert.True(t, ok) {
+		assert.Equal(t, "node-gpu", podState.NodeName)
 	}
 }

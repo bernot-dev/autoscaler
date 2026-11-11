@@ -53,6 +53,8 @@ type VerticalPodAutoscalerBuilder interface {
 	WithOOMMinBumpUp(minBumpUp *resource.Quantity) VerticalPodAutoscalerBuilder
 	WithCPUStartupBoost(boostType vpa_types.StartupBoostType, factor *int32, quantity *resource.Quantity, durationSeconds int32) VerticalPodAutoscalerBuilder
 	WithContainerCPUStartupBoost(containerName string, boostType vpa_types.StartupBoostType, factor *int32, quantity *resource.Quantity, durationSeconds int32) VerticalPodAutoscalerBuilder
+	WithSelector(selector *vpa_types.VerticalPodAutoscalerSelector) VerticalPodAutoscalerBuilder
+	WithNodeSelector(nodeSelector *metav1.LabelSelector) VerticalPodAutoscalerBuilder
 	AppendCondition(conditionType vpa_types.VerticalPodAutoscalerConditionType,
 		status corev1.ConditionStatus, reason, message string, lastTransitionTime time.Time) VerticalPodAutoscalerBuilder
 	AppendRecommendation(vpa_types.RecommendedContainerResources) VerticalPodAutoscalerBuilder
@@ -90,6 +92,7 @@ type verticalPodAutoscalerBuilder struct {
 	scalingMode             map[string]*vpa_types.ContainerScalingMode
 	containerStartupBoost   map[string]*vpa_types.StartupBoost
 	startupBoost            *vpa_types.StartupBoost
+	selector                *vpa_types.VerticalPodAutoscalerSelector
 	recommendation          RecommendationBuilder
 	conditions              []vpa_types.VerticalPodAutoscalerCondition
 	annotations             map[string]string
@@ -300,6 +303,20 @@ func (b *verticalPodAutoscalerBuilder) WithContainerCPUStartupBoost(containerNam
 	return &c
 }
 
+func (b *verticalPodAutoscalerBuilder) WithSelector(selector *vpa_types.VerticalPodAutoscalerSelector) VerticalPodAutoscalerBuilder {
+	c := *b
+	c.selector = selector
+	return &c
+}
+
+func (b *verticalPodAutoscalerBuilder) WithNodeSelector(nodeSelector *metav1.LabelSelector) VerticalPodAutoscalerBuilder {
+	c := *b
+	c.selector = &vpa_types.VerticalPodAutoscalerSelector{
+		NodeSelector: nodeSelector,
+	}
+	return &c
+}
+
 func (b *verticalPodAutoscalerBuilder) Get() *vpa_types.VerticalPodAutoscaler {
 	if len(b.containerNames) == 0 {
 		panic("Must call WithContainer() before Get()")
@@ -352,6 +369,7 @@ func (b *verticalPodAutoscalerBuilder) Get() *vpa_types.VerticalPodAutoscaler {
 			TargetRef:      b.targetRef,
 			Recommenders:   recommenders,
 			StartupBoost:   b.startupBoost,
+			Selector:       b.selector,
 		},
 		Status: vpa_types.VerticalPodAutoscalerStatus{
 			Recommendation: recommendation,

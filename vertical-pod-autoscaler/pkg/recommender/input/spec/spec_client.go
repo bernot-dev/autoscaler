@@ -37,6 +37,8 @@ type BasicPodSpec struct {
 	InitContainers []BasicContainerSpec
 	// PodPhase describing current life cycle phase of the Pod.
 	Phase corev1.PodPhase
+	// NodeName is the name of the node the pod is scheduled on (pod.Spec.NodeName).
+	NodeName string
 }
 
 // BasicContainerSpec contains basic information defining a container.
@@ -91,6 +93,7 @@ func newBasicPodSpec(pod *corev1.Pod) *BasicPodSpec {
 		Containers:     containerSpecs,
 		InitContainers: initContainerSpecs,
 		Phase:          pod.Status.Phase,
+		NodeName:       pod.Spec.NodeName,
 	}
 	return basicPodSpec
 }

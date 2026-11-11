@@ -115,6 +115,8 @@ func (r *recommender) UpdateVPAs() {
 	cnt := metrics_recommender.NewObjectCounter()
 	defer cnt.Observe()
 
+	r.clusterState.UpdateSelectorOverlapConditions()
+
 	// Create a channel to send VPA updates to workers
 	vpaUpdates := make(chan *vpaautoscalingv1.VerticalPodAutoscaler, len(r.clusterState.ObservedVPAs()))
 
@@ -177,6 +179,9 @@ func (r *recommender) RunOnce() {
 	ctx := context.Background()
 
 	klog.V(3).InfoS("Recommender Run")
+
+	r.clusterStateFeeder.LoadNodes()
+	timer.ObserveStep("LoadNodes")
 
 	r.clusterStateFeeder.LoadVPAs(ctx)
 	timer.ObserveStep("LoadVPAs")

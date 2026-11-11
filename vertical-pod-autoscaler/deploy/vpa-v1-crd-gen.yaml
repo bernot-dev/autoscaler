@@ -472,6 +472,72 @@ spec:
                       type: object
                     type: array
                 type: object
+              selector:
+                description: |-
+                  selector further restricts the set of pods, among those controlled by
+                  TargetRef, that this VPA applies to. When unset, the VPA applies to all
+                  pods controlled by TargetRef (current behavior).
+
+                  Recommendations are computed only from the selected pods, and only the
+                  selected pods are updated by the updater and admission controller.
+                minProperties: 1
+                properties:
+                  nodeSelector:
+                    description: |-
+                      nodeSelector selects pods by the labels of the node they run on.
+                      A pod is selected if its node's labels match the selector.
+                      In this iteration it is only allowed when TargetRef is a DaemonSet.
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                    x-kubernetes-validations:
+                    - message: nodeSelector must specify at least one matchLabels
+                        or matchExpressions entry
+                      rule: (has(self.matchLabels) && size(self.matchLabels) > 0)
+                        || (has(self.matchExpressions) && size(self.matchExpressions)
+                        > 0)
+                type: object
               startupBoost:
                 description: startupBoost specifies the startup boost policy for the
                   pod.
@@ -622,6 +688,15 @@ spec:
             required:
             - targetRef
             type: object
+            x-kubernetes-validations:
+            - message: startupBoost cannot be set when selector is set
+              rule: '!has(self.selector) || (!has(self.startupBoost) && (!has(self.resourcePolicy)
+                || !has(self.resourcePolicy.containerPolicies) || self.resourcePolicy.containerPolicies.all(p,
+                !has(p.startupBoost))))'
+            - message: selector.nodeSelector is only allowed when targetRef.kind is
+                DaemonSet
+              rule: '!has(self.selector) || !has(self.selector.nodeSelector) || (has(self.targetRef)
+                && self.targetRef.kind == ''DaemonSet'')'
           status:
             description: Current information about the autoscaler.
             properties:

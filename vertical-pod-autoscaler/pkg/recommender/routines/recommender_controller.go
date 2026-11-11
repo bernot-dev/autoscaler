@@ -24,11 +24,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	kube_client "k8s.io/client-go/kubernetes"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/checkpoint"
 	recommender_config "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/config"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input"
@@ -118,8 +120,14 @@ func NewRecommenderController(
 
 	ignoredNamespaces := strings.Split(commonFlags.IgnoredVpaObjectNamespaces, ",")
 
+	var nodeLister listersv1.NodeLister
+	if features.Enabled(features.VPANodeSelector) {
+		nodeLister = factory.Core().V1().Nodes().Lister()
+	}
+
 	clusterStateFeeder := input.ClusterStateFeederFactory{
 		PodLister:           podLister,
+		NodeLister:          nodeLister,
 		OOMObserver:         oomObserver,
 		MetricsClient:       input_metrics.NewMetricsClient(source, commonFlags.VpaObjectNamespace, "default-metrics-client"),
 		VpaCheckpointClient: vpaClient.AutoscalingV1(),

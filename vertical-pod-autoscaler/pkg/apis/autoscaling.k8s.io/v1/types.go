@@ -74,6 +74,8 @@ type VerticalPodAutoscalerRecommenderSelector struct {
 }
 
 // VerticalPodAutoscalerSpec is the specification of the behavior of the autoscaler.
+// +kubebuilder:validation:XValidation:rule="!has(self.selector) || (!has(self.startupBoost) && (!has(self.resourcePolicy) || !has(self.resourcePolicy.containerPolicies) || self.resourcePolicy.containerPolicies.all(p, !has(p.startupBoost))))",message="startupBoost cannot be set when selector is set"
+// +kubebuilder:validation:XValidation:rule="!has(self.selector) || !has(self.selector.nodeSelector) || (has(self.targetRef) && self.targetRef.kind == 'DaemonSet')",message="selector.nodeSelector is only allowed when targetRef.kind is DaemonSet"
 type VerticalPodAutoscalerSpec struct {
 
 	// TargetRef points to the controller managing the set of pods for the
@@ -114,6 +116,27 @@ type VerticalPodAutoscalerSpec struct {
 	// startupBoost specifies the startup boost policy for the pod.
 	// +optional
 	StartupBoost *StartupBoost `json:"startupBoost,omitempty"`
+
+	// selector further restricts the set of pods, among those controlled by
+	// TargetRef, that this VPA applies to. When unset, the VPA applies to all
+	// pods controlled by TargetRef (current behavior).
+	//
+	// Recommendations are computed only from the selected pods, and only the
+	// selected pods are updated by the updater and admission controller.
+	// +optional
+	Selector *VerticalPodAutoscalerSelector `json:"selector,omitempty"`
+}
+
+// VerticalPodAutoscalerSelector selects a subset of the pods controlled by
+// the VPA's TargetRef. Pods must match all of the specified selectors.
+// +kubebuilder:validation:MinProperties=1
+type VerticalPodAutoscalerSelector struct {
+	// nodeSelector selects pods by the labels of the node they run on.
+	// A pod is selected if its node's labels match the selector.
+	// In this iteration it is only allowed when TargetRef is a DaemonSet.
+	// +kubebuilder:validation:XValidation:rule="(has(self.matchLabels) && size(self.matchLabels) > 0) || (has(self.matchExpressions) && size(self.matchExpressions) > 0)",message="nodeSelector must specify at least one matchLabels or matchExpressions entry"
+	// +optional
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
 }
 
 // StartupBoost defines the startup boost policy.
@@ -435,6 +458,9 @@ var (
 	// ConfigUnsupported indicates that this VPA configuration is unsupported
 	// and recommendations will not be provided for it.
 	ConfigUnsupported VerticalPodAutoscalerConditionType = "ConfigUnsupported"
+	// SelectorOverlap indicates that, on some nodes this VPA's selector matches,
+	// another VPA with a selector controls the pods instead.
+	SelectorOverlap VerticalPodAutoscalerConditionType = "SelectorOverlap"
 )
 
 // VerticalPodAutoscalerCondition describes the state of

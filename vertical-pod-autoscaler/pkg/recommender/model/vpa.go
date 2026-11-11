@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	metrics_quality "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/quality"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -160,6 +161,9 @@ func (vpa *Vpa) updateRecommendationLocked(recommendation *vpa_types.Recommended
 	for _, containerRecommendation := range recommendation.ContainerRecommendations {
 		for container, state := range vpa.aggregateContainerStates {
 			if container.ContainerName() == containerRecommendation.ContainerName {
+				if features.Enabled(features.VPANodeSelector) && !state.isControlledByOrUnclaimed(vpa) {
+					continue
+				}
 				metrics_quality.ObserveRecommendationChange(state.GetLastRecommendation(), containerRecommendation.UncappedTarget, vpa.UpdateMode, vpa.PodCount)
 				// TODO(jkyros): state.SetLastRecommendation takes the AggregateContainerState mutex. Right now we're
 				// consistent everywhere (VPA mutex -> AggregateContainerState mutex) but if we're
@@ -206,6 +210,12 @@ type Vpa struct {
 	TargetRef *autoscalingv1.CrossVersionObjectReference
 	// PodCount contains number of live Pods matching a given VPA object.
 	PodCount int
+	// HasSelector is true when spec.selector is set on the VPA object.
+	HasSelector bool
+	// NodeSelector restricts matched pods/aggregations by node labels when HasSelector is true.
+	NodeSelector labels.Selector
+	// nodeLabels looks up the labels of a node by name in ClusterState.
+	nodeLabels func(nodeName string) (labels.Set, bool)
 
 	// mutex protects concurrent access to conditions and recommendation fields
 	mutex sync.RWMutex
@@ -256,9 +266,11 @@ func (vpa *Vpa) UseAggregationIfMatching(aggregationKey AggregateStateKey, aggre
 	}
 	if vpa.matchesAggregation(aggregationKey) {
 		vpa.aggregateContainerStates[aggregationKey] = aggregation
-		aggregation.IsUnderVPA = true
-		aggregation.UpdateMode = vpa.UpdateMode
-		aggregation.UpdateFromPolicy(vpa_api_util.GetContainerResourcePolicy(aggregationKey.ContainerName(), vpa.ResourcePolicy))
+		if !features.Enabled(features.VPANodeSelector) || aggregation.tryClaimControl(vpa) {
+			aggregation.IsUnderVPA = true
+			aggregation.UpdateMode = vpa.UpdateMode
+			aggregation.UpdateFromPolicy(vpa_api_util.GetContainerResourcePolicy(aggregationKey.ContainerName(), vpa.ResourcePolicy))
+		}
 	}
 }
 
@@ -297,7 +309,9 @@ func (vpa *Vpa) DeleteAggregation(aggregationKey AggregateStateKey) {
 	if !ok {
 		return
 	}
-	state.MarkNotAutoscaled()
+	if !features.Enabled(features.VPANodeSelector) || state.releaseControl(vpa) {
+		state.MarkNotAutoscaled()
+	}
 	delete(vpa.aggregateContainerStates, aggregationKey)
 }
 
@@ -333,7 +347,21 @@ func (vpa *Vpa) matchesAggregation(aggregationKey AggregateStateKey) bool {
 	if vpa.ID.Namespace != aggregationKey.Namespace() {
 		return false
 	}
-	return vpa.PodSelector != nil && vpa.PodSelector.Matches(aggregationKey.Labels())
+	if vpa.PodSelector == nil || !vpa.PodSelector.Matches(aggregationKey.Labels()) {
+		return false
+	}
+	if features.Enabled(features.VPANodeSelector) && vpa.HasSelector {
+		nodeName := aggregationKey.NodeName()
+		if nodeName == "" || vpa.NodeSelector == nil || vpa.nodeLabels == nil {
+			return false
+		}
+		nLabels, ok := vpa.nodeLabels(nodeName)
+		if !ok {
+			return false
+		}
+		return vpa.NodeSelector.Matches(nLabels)
+	}
+	return true
 }
 
 // SetResourcePolicy updates the resource policy of the VPA and the scaling
@@ -344,6 +372,9 @@ func (vpa *Vpa) SetResourcePolicy(resourcePolicy *vpa_types.PodResourcePolicy) {
 	}
 	vpa.ResourcePolicy = resourcePolicy
 	for container, state := range vpa.aggregateContainerStates {
+		if features.Enabled(features.VPANodeSelector) && !state.isControlledByOrUnclaimed(vpa) {
+			continue
+		}
 		state.UpdateFromPolicy(vpa_api_util.GetContainerResourcePolicy(container.ContainerName(), vpa.ResourcePolicy))
 	}
 }
@@ -359,6 +390,9 @@ func (vpa *Vpa) SetUpdateMode(updatePolicy *vpa_types.PodUpdatePolicy) {
 		vpa.UpdateMode = updatePolicy.UpdateMode
 	}
 	for _, state := range vpa.aggregateContainerStates {
+		if features.Enabled(features.VPANodeSelector) && !state.isControlledByOrUnclaimed(vpa) {
+			continue
+		}
 		state.UpdateMode = vpa.UpdateMode
 	}
 }

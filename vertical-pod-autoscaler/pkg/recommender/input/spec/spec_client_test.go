@@ -50,3 +50,26 @@ func TestGetPodSpecsReturnsSpecs(t *testing.T) {
 		assert.Contains(t, tc.podSpecs, podSpec, "One of returned BasicPodSpec is different than expected")
 	}
 }
+
+func TestGetPodSpecsPopulatesNodeName(t *testing.T) {
+	tc := &specClientTestCase{
+		podYamls: []string{`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: PodNode
+  namespace: default
+spec:
+  nodeName: worker-node-1
+  containers:
+  - name: c1
+    image: img1
+`},
+	}
+	client := tc.createFakeSpecClient()
+	podSpecs, err := client.GetPodSpecs()
+	assert.NoError(t, err)
+	if assert.Len(t, podSpecs, 1) {
+		assert.Equal(t, "worker-node-1", podSpecs[0].NodeName)
+	}
+}
